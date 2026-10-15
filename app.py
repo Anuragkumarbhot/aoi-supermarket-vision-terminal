@@ -90,7 +90,7 @@ def sync_to_sales_server(record):
                 data=payload,
                 headers={"Content-Type": "application/json", "Authorization": "Bearer STORE_TOKEN_123"},
                 method="POST"
-             ी
+             )
             with urllib.request.urlopen(req, timeout=3) as resp:
                 print(f"[Sales Server Sync] Inward Scan #{record['id']} synced successfully.")
         except Exception as e:
