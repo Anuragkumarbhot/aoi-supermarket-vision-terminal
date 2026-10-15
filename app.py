@@ -6,10 +6,8 @@ from flask import Flask, request, jsonify, send_file, render_template_string
 app = Flask(__name__)
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inventory_audit.db")
-# Optional: Paste your Firebase Realtime DB URL (e.g. "https://your-db.firebaseio.com/scans.json")
 FIREBASE_URL = os.environ.get("FIREBASE_URL", "")
 
-# --- 1. PERMANENT SQLITE DATABASE ENGINE (WAL MODE) ---
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -47,31 +45,31 @@ def get_all_scans():
         rows = conn.execute("SELECT * FROM scans ORDER BY id DESC").fetchall()
         return [dict(r) for r in rows]
 
-def mark_synced(scan_id):
+def update_scan_field(scan_id, field, value):
+    allowed = ["batch", "mfr", "exp", "mrp", "action"]
+    if field not in allowed:
+        return False
+    
+    # Recalculate mrp_num if mrp is edited
+    extra_update = ""
+    vals = [value]
+    if field == "mrp":
+        num_m = re.search(r'(\d+(?:\.\d{2})?)', value)
+        num_val = float(num_m.group(1)) if num_m else 0.0
+        extra_update = ", mrp_num = ?"
+        vals.append(num_val)
+    
+    vals.append(scan_id)
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("UPDATE scans SET synced = 1 WHERE id = ?", (scan_id,))
+        conn.execute(f"UPDATE scans SET {field} = ?{extra_update} WHERE id = ?", tuple(vals))
+        conn.commit()
+    return True
+
+def delete_scan_row(scan_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM scans WHERE id = ?", (scan_id,))
         conn.commit()
 
-def sync_to_cloud_async(record):
-    """Pushes scan record to Firebase Realtime Database or REST ERP in background."""
-    if not FIREBASE_URL:
-        return
-    def _worker():
-        try:
-            req = urllib.request.Request(
-                FIREBASE_URL,
-                data=json.dumps(record).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=4) as resp:
-                if resp.status in (200, 201):
-                    mark_synced(record["id"])
-        except Exception as e:
-            print(f"[Cloud Sync Pending] Saved in SQLite (ID #{record['id']}): {e}")
-    threading.Thread(target=_worker, daemon=True).start()
-
-# --- 2. VISION PREPROCESSING & TESSERACT OCR ---
 def preprocess_roi(pil_img):
     pil_img.thumbnail((1200, 1200))
     gray = pil_img.convert("L")
@@ -94,7 +92,6 @@ def run_tesseract_ocr(pil_img):
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-# --- 3. 4-LINE SEQUENTIAL STAMP PARSER ---
 def clean_ocr_digits(s):
     swap = {'O': '0', 'Q': '0', 'D': '0', 'I': '1', 'L': '1', '|': '1', 'S': '5', 'B': '8', 'Z': '2', 'g': '9', 'G': '6'}
     return "".join(swap.get(c, c) for c in s)
@@ -146,16 +143,15 @@ def parse_and_validate(raw_text):
         "raw_ocr": text[:180]
     }
     rec["id"] = insert_scan(rec)
-    sync_to_cloud_async(rec)
     return rec
 
-# --- 4. PERSISTENT WEB TERMINAL UI ---
+# --- 4. TOUCH TERMINAL UI WITH EDITABLE CELLS ---
 HTML_UI = """
 <!DOCTYPE html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AOI Vision Terminal (SQLite)</title>
+<title>AOI Vision Terminal (Editable)</title>
 <style>
   body { background:#111827; color:#fff; font-family:sans-serif; margin:0; padding:12px; text-align:center; }
   .badge { background:#065F46; color:#A7F3D0; padding:4px 10px; border-radius:12px; font-size:11px; display:inline-block; margin-bottom:8px; }
@@ -165,14 +161,17 @@ HTML_UI = """
   .btn-pdf { background:#3B82F6; color:#fff; width:32%; display:inline-block; }
   .btn-csv { background:#8B5CF6; color:#fff; width:32%; display:inline-block; }
   .btn-clear { background:#EF4444; color:#fff; width:32%; display:inline-block; }
-  table { width:100%; max-width:700px; margin:15px auto; border-collapse:collapse; font-size:11px; }
+  table { width:100%; max-width:750px; margin:15px auto; border-collapse:collapse; font-size:11px; }
   th, td { border:1px solid #374151; padding:6px 4px; text-align:center; }
   th { background:#1F2937; color:#9CA3AF; }
+  .editable { background:#1E293B; color:#38BDF8; cursor:pointer; border-radius:3px; padding:2px 4px; }
+  .editable:hover { background:#334155; }
+  .del-btn { background:#7F1D1D; color:#FCA5A5; border:none; padding:3px 8px; border-radius:4px; cursor:pointer; }
 </style>
 </head>
 <body>
   <h3 style="margin-bottom:4px;">AOI Supermarket Terminal</h3>
-  <div class="badge">SQLite WAL Active | Total Saved: <span id="count">{{ scans|length }}</span></div>
+  <div class="badge">SQLite WAL | Tap any cell to edit | Saved: <span id="count">{{ scans|length }}</span></div>
   
   <div class="card">
     <label class="file-btn btn-photo">
@@ -180,7 +179,7 @@ HTML_UI = """
     </label>
   </div>
 
-  <div id="status" style="color:#FBBF24; margin:8px; font-weight:bold; font-size:13px;">Ready. Database loaded from disk.</div>
+  <div id="status" style="color:#FBBF24; margin:8px; font-weight:bold; font-size:13px;">Ready. Tap cells in the table below to manually correct any misread OCR text.</div>
   <div id="debug" style="color:#9CA3AF; font-size:11px; background:#0B0F19; padding:6px; border-radius:4px; max-width:480px; margin:0 auto 10px auto; text-align:left; word-break:break-all;">Raw OCR: Waiting for scan...</div>
 
   <div style="max-width:480px; margin:0 auto;">
@@ -190,12 +189,17 @@ HTML_UI = """
   </div>
 
   <table id="logTable">
-    <thead><tr><th>#</th><th>Batch</th><th>MFR</th><th>EXP</th><th>MRP</th><th>Action</th></tr></thead>
+    <thead><tr><th>#</th><th>Batch</th><th>MFR</th><th>EXP</th><th>MRP</th><th>Action</th><th>Del</th></tr></thead>
     <tbody>
       {% for s in scans %}
-      <tr>
-        <td>{{ s.id }}</td><td>{{ s.batch }}</td><td>{{ s.mfr }}</td>
-        <td>{{ s.exp }}</td><td>{{ s.mrp }}</td><td>{{ s.action }}</td>
+      <tr id="row-{{ s.id }}">
+        <td>{{ s.id }}</td>
+        <td><span class="editable" onclick="editCell({{ s.id }}, 'batch', '{{ s.batch }}')">{{ s.batch }}</span></td>
+        <td><span class="editable" onclick="editCell({{ s.id }}, 'mfr', '{{ s.mfr }}')">{{ s.mfr }}</span></td>
+        <td><span class="editable" onclick="editCell({{ s.id }}, 'exp', '{{ s.exp }}')">{{ s.exp }}</span></td>
+        <td><span class="editable" onclick="editCell({{ s.id }}, 'mrp', '{{ s.mrp }}')">{{ s.mrp }}</span></td>
+        <td><span class="editable" onclick="editCell({{ s.id }}, 'action', '{{ s.action }}')">{{ s.action }}</span></td>
+        <td><button class="del-btn" onclick="deleteRow({{ s.id }})">X</button></td>
       </tr>
       {% endfor %}
     </tbody>
@@ -217,13 +221,53 @@ function uploadFile(e) {
     .then(function(d) {
       document.getElementById('status').innerText = 'Saved #' + d.id + ' -> Batch: ' + d.batch + ' | MRP: ' + d.mrp;
       document.getElementById('debug').innerText = 'Raw OCR Read: ' + d.raw_ocr;
-      var row = '<tr><td>' + d.id + '</td><td>' + d.batch + '</td><td>' + d.mfr + '</td><td>' + d.exp + '</td><td>' + d.mrp + '</td><td>' + d.action + '</td></tr>';
+      var row = '<tr id="row-' + d.id + '"><td>' + d.id + '</td>' +
+                '<td><span class="editable" onclick="editCell(' + d.id + ', \'batch\', \'' + d.batch + '\')">' + d.batch + '</span></td>' +
+                '<td><span class="editable" onclick="editCell(' + d.id + ', \'mfr\', \'' + d.mfr + '\')">' + d.mfr + '</span></td>' +
+                '<td><span class="editable" onclick="editCell(' + d.id + ', \'exp\', \'' + d.exp + '\')">' + d.exp + '</span></td>' +
+                '<td><span class="editable" onclick="editCell(' + d.id + ', \'mrp\', \'' + d.mrp + '\')">' + d.mrp + '</span></td>' +
+                '<td><span class="editable" onclick="editCell(' + d.id + ', \'action\', \'' + d.action + '\')">' + d.action + '</span></td>' +
+                '<td><button class="del-btn" onclick="deleteRow(' + d.id + ')">X</button></td></tr>';
       document.querySelector('#logTable tbody').insertAdjacentHTML('afterbegin', row);
       var c = document.getElementById('count');
       c.innerText = parseInt(c.innerText) + 1;
     });
   };
   reader.readAsDataURL(file);
+}
+
+function editCell(id, field, currentVal) {
+  var newVal = prompt("Edit " + field.toUpperCase() + " for Scan #" + id + ":", currentVal);
+  if (newVal === null || newVal.trim() === "") return;
+  
+  fetch('/update', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: id, field: field, value: newVal.trim() })
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.status === "success") {
+      window.location.reload();
+    } else {
+      alert("Update failed.");
+    }
+  });
+}
+
+function deleteRow(id) {
+  if (!confirm("Delete scan #" + id + "?")) return;
+  fetch('/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: id })
+  })
+  .then(function() {
+    var row = document.getElementById('row-' + id);
+    if (row) row.remove();
+    var c = document.getElementById('count');
+    c.innerText = Math.max(0, parseInt(c.innerText) - 1);
+  });
 }
 
 function clearDB() {
@@ -249,6 +293,18 @@ def scan():
     record = parse_and_validate(raw_text)
     return jsonify(record)
 
+@app.route("/update", methods=["POST"])
+def update():
+    data = request.get_json()
+    success = update_scan_field(data["id"], data["field"], data["value"])
+    return jsonify({"status": "success" if success else "error"})
+
+@app.route("/delete", methods=["POST"])
+def delete():
+    data = request.get_json()
+    delete_scan_row(data["id"])
+    return jsonify({"status": "success"})
+
 @app.route("/clear", methods=["POST"])
 def clear_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -264,7 +320,7 @@ def export_pdf():
     img = Image.new("RGB", (W, H), "white")
     draw = ImageDraw.Draw(img)
     draw.rectangle([0, 0, W, 130], fill="#1E3A8A")
-    draw.text((40, 35), "SUPERMARKET BATCH & EXPIRY AUDIT REPORT (SQLITE)", fill="white", font_size=26)
+    draw.text((40, 35), "SUPERMARKET BATCH & EXPIRY AUDIT REPORT", fill="white", font_size=28)
     total_val = sum(r["mrp_num"] for r in records)
     sub = f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  Total Units: {len(records)}  |  Total MRP Value: Rs. {total_val:.2f}"
     draw.text((40, 85), sub, fill="#93C5FD", font_size=18)
