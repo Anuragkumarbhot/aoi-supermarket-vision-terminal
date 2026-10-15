@@ -1,4 +1,4 @@
-import os, re, io, csv, json, base64, sqlite3, subprocess, tempfile, threading, urllib.request
+import os, re, io, csv, json, base64, sqlite3, subprocess, tempfile
 from PIL import Image, ImageOps, ImageStat, ImageDraw
 from datetime import datetime
 from flask import Flask, request, jsonify, send_file, render_template_string
@@ -6,7 +6,6 @@ from flask import Flask, request, jsonify, send_file, render_template_string
 app = Flask(__name__)
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inventory_audit.db")
-FIREBASE_URL = os.environ.get("FIREBASE_URL", "")
 
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -22,8 +21,7 @@ def init_db():
                 mrp TEXT,
                 mrp_num REAL,
                 action TEXT,
-                raw_ocr TEXT,
-                synced INTEGER DEFAULT 0
+                raw_ocr TEXT
             )
         """)
         conn.commit()
@@ -32,10 +30,10 @@ def insert_scan(rec):
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO scans (time, brand, batch, mfr, exp, mrp, mrp_num, action, raw_ocr, synced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO scans (time, brand, batch, mfr, exp, mrp, mrp_num, action, raw_ocr)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (rec["time"], rec["brand"], rec["batch"], rec["mfr"], rec["exp"],
-              rec["mrp"], rec["mrp_num"], rec["action"], rec["raw_ocr"], 0))
+              rec["mrp"], rec["mrp_num"], rec["action"], rec["raw_ocr"]))
         conn.commit()
         return cur.lastrowid
 
@@ -47,18 +45,14 @@ def get_all_scans():
 
 def update_scan_field(scan_id, field, value):
     allowed = ["batch", "mfr", "exp", "mrp", "action"]
-    if field not in allowed:
-        return False
-    
-    # Recalculate mrp_num if mrp is edited
-    extra_update = ""
+    if field not in allowed: return False
     vals = [value]
+    extra_update = ""
     if field == "mrp":
         num_m = re.search(r'(\d+(?:\.\d{2})?)', value)
         num_val = float(num_m.group(1)) if num_m else 0.0
         extra_update = ", mrp_num = ?"
         vals.append(num_val)
-    
     vals.append(scan_id)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(f"UPDATE scans SET {field} = ?{extra_update} WHERE id = ?", tuple(vals))
@@ -89,8 +83,7 @@ def run_tesseract_ocr(pil_img):
         )
         return res.stdout
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        if os.path.exists(tmp_path): os.remove(tmp_path)
 
 def clean_ocr_digits(s):
     swap = {'O': '0', 'Q': '0', 'D': '0', 'I': '1', 'L': '1', '|': '1', 'S': '5', 'B': '8', 'Z': '2', 'g': '9', 'G': '6'}
@@ -98,7 +91,6 @@ def clean_ocr_digits(s):
 
 def parse_and_validate(raw_text):
     text = raw_text.upper()
-
     batch_m = re.search(r'(?:B(?:ATCH|ATEH)?\.?\s*(?:NO|N0)?\.?)\s*[:\-]?\s*([A-Z0-9\-]{4,12})', text)
     batch_code = batch_m.group(1) if batch_m else "GL-26105"
 
@@ -121,15 +113,11 @@ def parse_and_validate(raw_text):
         try:
             exp_dt = datetime.strptime(exp_str, fmt)
             days_left = (exp_dt - now).days
-            if days_left <= 0:
-                action = "EXPIRED - RETURN"
-            elif days_left <= 30:
-                action = "DISCOUNT (" + str(days_left) + "d)"
-            else:
-                action = "FRESH (" + str(days_left) + "d)"
+            if days_left <= 0: action = "EXPIRED - RETURN"
+            elif days_left <= 30: action = f"DISCOUNT ({days_left}d)"
+            else: action = f"FRESH ({days_left}d)"
             break
-        except ValueError:
-            pass
+        except ValueError: pass
 
     rec = {
         "time": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -145,71 +133,130 @@ def parse_and_validate(raw_text):
     rec["id"] = insert_scan(rec)
     return rec
 
-# --- 4. TOUCH TERMINAL UI WITH EDITABLE CELLS ---
+# --- REFINED DASHBOARD UI ---
 HTML_UI = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+<meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AOI Vision Terminal (Editable)</title>
+<title>AOI Supermarket Terminal</title>
 <style>
-  body { background:#111827; color:#fff; font-family:sans-serif; margin:0; padding:12px; text-align:center; }
-  .badge { background:#065F46; color:#A7F3D0; padding:4px 10px; border-radius:12px; font-size:11px; display:inline-block; margin-bottom:8px; }
-  .card { background:#1F2937; padding:14px; border-radius:8px; max-width:480px; margin:0 auto 10px auto; border:1px solid #374151; }
-  button, .file-btn { padding:14px; font-size:14px; font-weight:bold; border-radius:6px; border:none; cursor:pointer; width:100%; margin-bottom:8px; box-sizing:border-box; }
-  .btn-photo { background:#F59E0B; color:#000; display:block; text-align:center; text-decoration:none; }
-  .btn-pdf { background:#3B82F6; color:#fff; width:32%; display:inline-block; }
-  .btn-csv { background:#8B5CF6; color:#fff; width:32%; display:inline-block; }
-  .btn-clear { background:#EF4444; color:#fff; width:32%; display:inline-block; }
-  table { width:100%; max-width:750px; margin:15px auto; border-collapse:collapse; font-size:11px; }
-  th, td { border:1px solid #374151; padding:6px 4px; text-align:center; }
-  th { background:#1F2937; color:#9CA3AF; }
-  .editable { background:#1E293B; color:#38BDF8; cursor:pointer; border-radius:3px; padding:2px 4px; }
-  .editable:hover { background:#334155; }
-  .del-btn { background:#7F1D1D; color:#FCA5A5; border:none; padding:3px 8px; border-radius:4px; cursor:pointer; }
+  :root {
+    --bg-main: #0F172A;
+    --bg-card: #1E293B;
+    --border-color: #334155;
+    --accent-green: #10B981;
+    --accent-amber: #F59E0B;
+    --accent-blue: #3B82F6;
+    --accent-purple: #8B5CF6;
+    --accent-red: #EF4444;
+    --text-main: #F8FAFC;
+    --text-muted: #94A3B8;
+  }
+  body { background: var(--bg-main); color: var(--text-main); font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 16px; text-align: center; }
+  .container { max-width: 600px; margin: 0 auto; }
+  
+  /* Header Card */
+  .header-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; padding: 20px; margin-bottom: 16px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
+  h2 { margin: 0 0 6px 0; font-size: 22px; color: #fff; letter-spacing: 0.5px; }
+  .subtitle { color: var(--text-muted); font-size: 13px; margin-bottom: 14px; }
+  .badge-row { display: flex; justify-content: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+  .badge { background: rgba(16, 185, 129, 0.15); color: #34D399; border: 1px solid rgba(16, 185, 129, 0.3); padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+
+  /* Scan Action Button */
+  .btn-scan { background: linear-gradient(135deg, #10B981 0%, #059669 100%); color: #000; font-size: 16px; font-weight: 700; padding: 16px; border-radius: 10px; border: none; cursor: pointer; width: 100%; box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3); transition: transform 0.1s ease; display: flex; align-items: center; justify-content: center; gap: 8px; }
+  .btn-scan:active { transform: scale(0.98); }
+
+  /* Status & Debug Box */
+  .status-box { background: rgba(15, 23, 42, 0.6); border: 1px solid var(--border-color); border-radius: 8px; padding: 12px; margin-top: 14px; text-align: left; }
+  #status { color: var(--accent-amber); font-weight: 600; font-size: 13px; margin-bottom: 4px; }
+  #debug { color: var(--text-muted); font-size: 11px; font-family: monospace; word-break: break-all; }
+
+  /* Action Bar */
+  .action-bar { display: flex; gap: 8px; margin-bottom: 20px; }
+  .action-btn { flex: 1; padding: 12px; font-size: 13px; font-weight: 700; border-radius: 8px; border: none; cursor: pointer; color: #fff; display: flex; align-items: center; justify-content: center; gap: 6px; }
+  .btn-pdf { background: var(--accent-blue); }
+  .btn-csv { background: var(--accent-purple); }
+  .btn-clear { background: rgba(239, 68, 68, 0.2); color: #FCA5A5; border: 1px solid rgba(239, 68, 68, 0.4); }
+
+  /* Audit Table */
+  .table-container { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; text-align: center; }
+  th { background: #0B0F19; color: var(--text-muted); padding: 10px 6px; font-weight: 600; border-bottom: 1px solid var(--border-color); }
+  td { padding: 8px 4px; border-bottom: 1px solid var(--border-color); color: #E2E8F0; }
+  tr:last-child td { border-bottom: none; }
+  
+  .editable { background: rgba(56, 189, 248, 0.1); color: #38BDF8; border: 1px dashed rgba(56, 189, 248, 0.3); border-radius: 4px; padding: 2px 6px; cursor: pointer; display: inline-block; }
+  .editable:hover { background: rgba(56, 189, 248, 0.2); }
+  .del-btn { background: transparent; color: #EF4444; border: none; font-size: 14px; cursor: pointer; padding: 4px; }
+  .del-btn:hover { color: #DC2626; }
 </style>
 </head>
 <body>
-  <h3 style="margin-bottom:4px;">AOI Supermarket Terminal</h3>
-  <div class="badge">SQLite WAL | Tap any cell to edit | Saved: <span id="count">{{ scans|length }}</span></div>
-  
-  <div class="card">
-    <label class="file-btn btn-photo">
-      📷 SNAP CLOSE-UP STAMP (ONLY 4 LINES) <input type="file" accept="image/*" capture="environment" style="display:none" onchange="uploadFile(event)">
+
+<div class="container">
+  <div class="header-card">
+    <h2>AOI Supermarket Terminal</h2>
+    <div class="subtitle">Automated Optical Batch & Expiry Inspection Engine</div>
+    
+    <div class="badge-row">
+      <div class="badge">SQLite WAL Active</div>
+      <div class="badge">Total Scans: <span id="count">{{ scans|length }}</span></div>
+    </div>
+
+    <label class="btn-scan">
+      <span>📷 SNAP CLOSE-UP STAMP (4-LINE OCR)</span>
+      <input type="file" accept="image/*" capture="environment" style="display:none" onchange="uploadFile(event)">
     </label>
+
+    <div class="status-box">
+      <div id="status">Status: Ready. Frame Batch, MFD, EXP, and MRP closely.</div>
+      <div id="debug">Raw OCR: Waiting for scan...</div>
+    </div>
   </div>
 
-  <div id="status" style="color:#FBBF24; margin:8px; font-weight:bold; font-size:13px;">Ready. Tap cells in the table below to manually correct any misread OCR text.</div>
-  <div id="debug" style="color:#9CA3AF; font-size:11px; background:#0B0F19; padding:6px; border-radius:4px; max-width:480px; margin:0 auto 10px auto; text-align:left; word-break:break-all;">Raw OCR: Waiting for scan...</div>
-
-  <div style="max-width:480px; margin:0 auto;">
-    <button class="btn-pdf" onclick="window.location='/export_pdf'">PDF Report</button>
-    <button class="btn-csv" onclick="window.location='/export_csv'">ERP CSV</button>
-    <button class="btn-clear" onclick="clearDB()">Reset Log</button>
+  <div class="action-bar">
+    <button class="action-btn btn-pdf" onclick="window.location='/export_pdf'">📄 Download PDF</button>
+    <button class="action-btn btn-csv" onclick="window.location='/export_csv'">📊 Export CSV</button>
+    <button class="action-btn btn-clear" onclick="clearDB()">🔄 Reset Shift</button>
   </div>
 
-  <table id="logTable">
-    <thead><tr><th>#</th><th>Batch</th><th>MFR</th><th>EXP</th><th>MRP</th><th>Action</th><th>Del</th></tr></thead>
-    <tbody>
-      {% for s in scans %}
-      <tr id="row-{{ s.id }}">
-        <td>{{ s.id }}</td>
-        <td><span class="editable" onclick="editCell({{ s.id }}, 'batch', '{{ s.batch }}')">{{ s.batch }}</span></td>
-        <td><span class="editable" onclick="editCell({{ s.id }}, 'mfr', '{{ s.mfr }}')">{{ s.mfr }}</span></td>
-        <td><span class="editable" onclick="editCell({{ s.id }}, 'exp', '{{ s.exp }}')">{{ s.exp }}</span></td>
-        <td><span class="editable" onclick="editCell({{ s.id }}, 'mrp', '{{ s.mrp }}')">{{ s.mrp }}</span></td>
-        <td><span class="editable" onclick="editCell({{ s.id }}, 'action', '{{ s.action }}')">{{ s.action }}</span></td>
-        <td><button class="del-btn" onclick="deleteRow({{ s.id }})">X</button></td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <div class="table-container">
+    <table id="logTable">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Batch Code</th>
+          <th>MFR</th>
+          <th>EXP</th>
+          <th>MRP</th>
+          <th>Action</th>
+          <th>Del</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in scans %}
+        <tr id="row-{{ s.id }}">
+          <td>{{ s.id }}</td>
+          <td><span class="editable" onclick="editCell({{ s.id }}, 'batch', '{{ s.batch }}')">{{ s.batch }}</span></td>
+          <td><span class="editable" onclick="editCell({{ s.id }}, 'mfr', '{{ s.mfr }}')">{{ s.mfr }}</span></td>
+          <td><span class="editable" onclick="editCell({{ s.id }}, 'exp', '{{ s.exp }}')">{{ s.exp }}</span></td>
+          <td><span class="editable" onclick="editCell({{ s.id }}, 'mrp', '{{ s.mrp }}')">{{ s.mrp }}</span></td>
+          <td><span class="editable" onclick="editCell({{ s.id }}, 'action', '{{ s.action }}')">{{ s.action }}</span></td>
+          <td><button class="del-btn" onclick="deleteRow({{ s.id }})" title="Delete row">🗑️</button></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
 
 <script>
 function uploadFile(e) {
   var file = e.target.files[0];
   if (!file) return;
-  document.getElementById('status').innerText = "Processing & Saving to SQLite...";
+  document.getElementById('status').innerText = "Processing dot-matrix OCR & saving...";
   var reader = new FileReader();
   reader.onload = function(ev) {
     fetch('/scan', {
@@ -219,7 +266,7 @@ function uploadFile(e) {
     })
     .then(function(r) { return r.json(); })
     .then(function(d) {
-      document.getElementById('status').innerText = 'Saved #' + d.id + ' -> Batch: ' + d.batch + ' | MRP: ' + d.mrp;
+      document.getElementById('status').innerText = 'Success! Batch: ' + d.batch + ' | EXP: ' + d.exp + ' | MRP: ' + d.mrp;
       document.getElementById('debug').innerText = 'Raw OCR Read: ' + d.raw_ocr;
       var row = '<tr id="row-' + d.id + '"><td>' + d.id + '</td>' +
                 '<td><span class="editable" onclick="editCell(' + d.id + ', \'batch\', \'' + d.batch + '\')">' + d.batch + '</span></td>' +
@@ -227,7 +274,7 @@ function uploadFile(e) {
                 '<td><span class="editable" onclick="editCell(' + d.id + ', \'exp\', \'' + d.exp + '\')">' + d.exp + '</span></td>' +
                 '<td><span class="editable" onclick="editCell(' + d.id + ', \'mrp\', \'' + d.mrp + '\')">' + d.mrp + '</span></td>' +
                 '<td><span class="editable" onclick="editCell(' + d.id + ', \'action\', \'' + d.action + '\')">' + d.action + '</span></td>' +
-                '<td><button class="del-btn" onclick="deleteRow(' + d.id + ')">X</button></td></tr>';
+                '<td><button class="del-btn" onclick="deleteRow(' + d.id + ')">🗑️</button></td></tr>';
       document.querySelector('#logTable tbody').insertAdjacentHTML('afterbegin', row);
       var c = document.getElementById('count');
       c.innerText = parseInt(c.innerText) + 1;
@@ -239,19 +286,12 @@ function uploadFile(e) {
 function editCell(id, field, currentVal) {
   var newVal = prompt("Edit " + field.toUpperCase() + " for Scan #" + id + ":", currentVal);
   if (newVal === null || newVal.trim() === "") return;
-  
   fetch('/update', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id: id, field: field, value: newVal.trim() })
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    if (d.status === "success") {
-      window.location.reload();
-    } else {
-      alert("Update failed.");
-    }
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.status === "success") { window.location.reload(); }
   });
 }
 
@@ -261,8 +301,7 @@ function deleteRow(id) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id: id })
-  })
-  .then(function() {
+  }).then(function() {
     var row = document.getElementById('row-' + id);
     if (row) row.remove();
     var c = document.getElementById('count');
@@ -271,7 +310,7 @@ function deleteRow(id) {
 }
 
 function clearDB() {
-  if (!confirm("Clear all saved scans for a new shift?")) return;
+  if (!confirm("Clear all scanned records for a new shift?")) return;
   fetch('/clear', { method: 'POST' }).then(function() { window.location.reload(); });
 }
 </script>
