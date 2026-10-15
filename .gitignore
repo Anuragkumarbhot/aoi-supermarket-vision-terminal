@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.pdf
+*.csv
+*.png
+*.jpg
+!samples/*.jpg
+!docs/*.jpg
+.env
+venv/
+vision_env/
