@@ -1679,6 +1679,7 @@ def create_supplier_invoice():
             raise ValueError(f"Invoice total does not equal line totals ({round(calculated, 2):.2f}).")
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("BEGIN IMMEDIATE")
+            conn.row_factory = sqlite3.Row
             po_rows = {}
             for po_line_id, quantity, unit_cost, line_total in normalized:
                 po = conn.execute(
@@ -1717,6 +1718,7 @@ def create_supplier_invoice():
 def rerun_supplier_invoice_reconciliation(invoice_id):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("BEGIN IMMEDIATE")
+        conn.row_factory = sqlite3.Row
         try:
             report = reconcile_supplier_invoice(conn, invoice_id)
         except ValueError as exc:
