@@ -609,7 +609,7 @@ HTML_UI = """
       <tbody>
         {% for po in pending_pos %}
         <tr>
-          <td><b>{{ po.po_id }}</b><br>{{ po.supplier }}<br><small>{{ po.supplier_contact }} {{ po.supplier_phone }}</small></td>
+          <td><b>{{ po.po_id }}</b><br>{{ po.supplier }}<br><small>{{ po.supplier_contact }} {{ po.supplier_phone }}<br>{{ po.supplier_email }}</small></td>
           <td>{{ po.item_name }}<br><small>{{ po.expected_batch }}</small></td>
           <td>Rs.{{ "%.2f"|format(po.expected_mrp) }}</td>
           <td>{{ po.ordered_qty }}</td>
