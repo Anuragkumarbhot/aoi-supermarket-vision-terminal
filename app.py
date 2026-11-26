@@ -72,7 +72,37 @@ def init_db():
                 received_qty INTEGER DEFAULT 0
             )
         """)
-        # Additive migration keeps existing local inventory databases usable.
+        # Additive migrations keep existing local inventory databases usable.
+        po_columns = {row[1] for row in conn.execute("PRAGMA table_info(pending_orders)")}
+        for column, definition in (
+            ("supplier_contact", "TEXT NOT NULL DEFAULT ''"),
+            ("supplier_phone", "TEXT NOT NULL DEFAULT ''"),
+            ("supplier_email", "TEXT NOT NULL DEFAULT ''"),
+            ("order_date", "TEXT NOT NULL DEFAULT ''"),
+            ("expected_delivery", "TEXT NOT NULL DEFAULT ''"),
+            ("notes", "TEXT NOT NULL DEFAULT ''"),
+            ("status", "TEXT NOT NULL DEFAULT 'OPEN'"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+            ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in po_columns:
+                conn.execute(f"ALTER TABLE pending_orders ADD COLUMN {column} {definition}")
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pending_orders_batch_status
+            ON pending_orders(expected_batch, status)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS purchase_order_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                po_rowid INTEGER NOT NULL,
+                po_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                operator TEXT NOT NULL,
+                event_at TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}'
+            )
+        """)
         scan_columns = {row[1] for row in conn.execute("PRAGMA table_info(scans)")}
         for column, definition in (
             ("review_status", "TEXT NOT NULL DEFAULT 'PENDING'"),
@@ -147,7 +177,7 @@ def insert_scan(rec):
         if rec.get("data_valid") and not already_expired:
             matches = cur.execute(
                 """SELECT rowid, expected_mrp, ordered_qty, received_qty
-                   FROM pending_orders WHERE UPPER(TRIM(expected_batch)) = UPPER(TRIM(?))""",
+                   FROM pending_orders WHERE UPPER(TRIM(expected_batch)) = UPPER(TRIM(?)) AND status='OPEN'""",
                 (rec["batch"],)
             ).fetchall()
             exact = [row for row in matches
@@ -227,11 +257,22 @@ def review_scan(scan_id, decision, note=""):
             """UPDATE pending_orders SET received_qty = received_qty + 1
                WHERE rowid = ? AND UPPER(TRIM(expected_batch)) = UPPER(TRIM(?))
                  AND expected_mrp IS NOT NULL AND ABS(expected_mrp - ?) < 0.005
-                 AND received_qty < ordered_qty""",
+                 AND received_qty < ordered_qty AND status='OPEN'""",
             (po_rowid, scan["batch"], scan["mrp_num"])
         )
         if cur.rowcount != 1:
             return False, "Purchase order no longer matches or its ordered quantity is already reached."
+        conn.execute(
+            """UPDATE pending_orders SET status='COMPLETE', updated_at=?
+               WHERE rowid=? AND received_qty >= ordered_qty AND status='OPEN'""",
+            (datetime.now().isoformat(timespec="seconds"), po_rowid)
+        )
+        record_po_event(
+            conn, po_rowid, scan["matched_po_rowid"] and scan["batch"] and
+            conn.execute("SELECT po_id FROM pending_orders WHERE rowid=?", (po_rowid,)).fetchone()[0] or "",
+            "SCAN_RECEIPT_APPROVED", note,
+            {"scan_id": scan_id, "quantity": 1}
+        )
         conn.execute(
             "UPDATE scans SET review_status='APPROVED', reviewed_at=?, review_note=? WHERE id=? AND review_status='PENDING'",
             (datetime.now().isoformat(timespec="seconds"), note.strip(), scan_id)
@@ -495,6 +536,9 @@ HTML_UI = """
   .del-btn { background: transparent; color: #EF4444; border: none; font-size: 12px; cursor: pointer; }
   .review-btn { background: #047857; color: white; padding: 5px 7px; margin: 2px; }
   .reject-btn { background: #991B1B; color: white; padding: 5px 7px; margin: 2px; }
+  .po-form { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px; }
+  .po-form input { min-width:0; padding:8px; border-radius:6px; border:1px solid var(--border); background:#0B1220; color:#F8FAFC; font-size:11px; }
+  .po-button { background:#1D4ED8; color:white; padding:5px 7px; margin:2px; }
 </style>
 </head>
 <body>
@@ -524,18 +568,67 @@ HTML_UI = """
 
   <div id="banner" class="banner">v3.0 Neural Engine Ready — YOLOv8 ROI BBox + Multi-Task Pipeline</div>
 
-  <!-- PENDING STOCK TABLE -->
+  <!-- PURCHASE ORDER MANAGEMENT V1 -->
+  <div class="table-wrap" style="padding:8px; text-align:left;">
+    <div style="font-size:12px;font-weight:800;color:#93C5FD;margin-bottom:8px;">📦 PURCHASE ORDER MANAGEMENT V1</div>
+    <form id="poForm" class="po-form" onsubmit="createPurchaseOrder(event)">
+      <input name="po_id" placeholder="PO number *" required maxlength="40">
+      <input name="supplier" placeholder="Supplier name *" required maxlength="120">
+      <input name="item_name" placeholder="Item / product *" required maxlength="120">
+      <input name="expected_batch" placeholder="Expected batch *" required maxlength="40">
+      <input name="expected_mrp" type="number" step="0.01" min="0.01" placeholder="Expected MRP *" required>
+      <input name="ordered_qty" type="number" step="1" min="1" placeholder="Ordered qty *" required>
+      <input name="supplier_contact" placeholder="Contact person">
+      <input name="supplier_phone" placeholder="Supplier phone">
+      <input name="supplier_email" type="email" placeholder="Supplier email">
+      <input name="order_date" type="date" title="Order date">
+      <input name="expected_delivery" type="date" title="Expected delivery">
+      <input name="notes" placeholder="Notes (optional)">
+      <button class="review-btn" type="submit">＋ Create PO line</button>
+    </form>
+    <div style="margin-top:10px;">
+      <textarea id="poCsvText" rows="3" style="width:100%;box-sizing:border-box;background:#0B1220;color:#E2E8F0;border:1px solid var(--border);border-radius:6px;padding:7px;font-size:11px;" placeholder="CSV import headers: po_id,supplier,item_name,expected_batch,expected_mrp,ordered_qty,supplier_contact,supplier_phone,supplier_email,order_date,expected_delivery,notes"></textarea>
+      <button class="po-button" onclick="importPurchaseOrders()">Import CSV</button>
+    </div>
+  </div>
   <div class="table-wrap">
-    <div style="background:#090D16; padding:5px; font-size:10px; font-weight:bold; color:#93C5FD; border-bottom:1px solid var(--border);">📦 Pending Purchase Orders</div>
+    <div style="background:#090D16; padding:5px; font-size:10px; font-weight:bold; color:#93C5FD; border-bottom:1px solid var(--border);">📦 PURCHASE ORDER LINES</div>
     <table>
-      <thead><tr><th>PO ID</th><th>Item</th><th>Target Batch</th><th>MRP</th><th>Ordered</th><th>Received</th></tr></thead>
+      <thead><tr><th>PO / Supplier</th><th>Item / Batch</th><th>MRP</th><th>Ordered</th><th>Received</th><th>Remaining</th><th>Delivery</th><th>Status</th><th>Actions</th></tr></thead>
       <tbody>
         {% for po in pending_pos %}
         <tr>
-          <td>{{ po.po_id }}</td><td>{{ po.item_name }}</td><td><b>{{ po.expected_batch }}</b></td>
-          <td>Rs.{{ po.expected_mrp }}</td><td>{{ po.ordered_qty }}</td>
-          <td><b id="po-rec" style="color:#34D399;">{{ po.received_qty }}</b></td>
+          <td><b>{{ po.po_id }}</b><br>{{ po.supplier }}<br><small>{{ po.supplier_contact }} {{ po.supplier_phone }}</small></td>
+          <td>{{ po.item_name }}<br><small>{{ po.expected_batch }}</small></td>
+          <td>Rs.{{ "%.2f"|format(po.expected_mrp) }}</td>
+          <td>{{ po.ordered_qty }}</td>
+          <td>{{ po.received_qty }}</td>
+          <td>{{ po.remaining_qty }}</td>
+          <td>{{ po.expected_delivery or "—" }}</td>
+          <td>{{ po.line_status }}</td>
+          <td>
+            {% if po.line_status == 'OPEN' %}
+            <button class="po-button" onclick="receivePurchaseOrder({{ po.line_id }})">Receive</button>
+            <button class="po-button" onclick="editPurchaseOrder({{ po.line_id }})">Edit</button>
+            <button class="reject-btn" onclick="closePurchaseOrder({{ po.line_id }})">Close</button>
+            {% else %}—{% endif %}
+          </td>
         </tr>
+        {% else %}
+        <tr><td colspan="9">No purchase-order lines yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="table-wrap">
+    <div style="background:#090D16; padding:5px; font-size:10px; font-weight:bold; color:#FBBF24; border-bottom:1px solid var(--border);">📋 Recent PO Activity</div>
+    <table>
+      <thead><tr><th>Time</th><th>PO</th><th>Event</th><th>Operator</th><th>Note</th></tr></thead>
+      <tbody>
+        {% for e in po_events %}
+        <tr><td>{{ e.event_at }}</td><td>{{ e.po_id }}</td><td>{{ e.event_type }}</td><td>{{ e.operator }}</td><td>{{ e.note }}</td></tr>
+        {% else %}
+        <tr><td colspan="5">No purchase-order activity yet.</td></tr>
         {% endfor %}
       </tbody>
     </table>
@@ -589,6 +682,75 @@ let videoTrack = null, torchOn = false, autoTimer = null, isScanning = false, ac
 
 navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } } })
 .then(stream => { video.srcObject = stream; videoTrack = stream.getVideoTracks()[0]; }).catch(() => {});
+
+async function poRequest(url, method, body) {
+  const response = await fetch(url, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body)
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || "Purchase-order operation failed.");
+  return data;
+}
+
+async function createPurchaseOrder(event) {
+  event.preventDefault();
+  const form = document.getElementById('poForm');
+  const data = Object.fromEntries(new FormData(form).entries());
+  try {
+    const result = await poRequest('/purchase-orders', 'POST', data);
+    alert(result.message || "Purchase-order line created.");
+    window.location.reload();
+  } catch (e) { alert(e.message); }
+}
+
+async function importPurchaseOrders() {
+  const csvText = document.getElementById('poCsvText').value;
+  if (!csvText.trim()) { alert("Paste a CSV file's contents first."); return; }
+  if (!confirm("Import all valid PO lines from this CSV? Import is all-or-nothing.")) return;
+  try {
+    const result = await poRequest('/purchase-orders/import', 'POST', { csv_text: csvText });
+    alert(result.message || "PO import completed.");
+    window.location.reload();
+  } catch (e) { alert(e.message); }
+}
+
+async function receivePurchaseOrder(lineId) {
+  const quantity = prompt("How many units physically received in this delivery?");
+  if (quantity === null) return;
+  const note = prompt("Receipt note / delivery reference (required):", "");
+  if (note === null) return;
+  if (!confirm("Record this partial/full physical delivery? Ensure the units have been counted.")) return;
+  try {
+    const result = await poRequest('/purchase-orders/' + lineId + '/receive', 'POST', {
+      quantity: quantity, note: note
+    });
+    alert(result.message);
+    window.location.reload();
+  } catch (e) { alert(e.message); }
+}
+
+async function editPurchaseOrder(lineId) {
+  const field = prompt("Field to edit: supplier, supplier_contact, supplier_phone, supplier_email, item_name, expected_batch, expected_mrp, ordered_qty, order_date, expected_delivery, notes");
+  if (!field) return;
+  const value = prompt("New value for " + field + ":");
+  if (value === null) return;
+  try {
+    const result = await poRequest('/purchase-orders/' + lineId, 'PUT', { [field.trim()]: value });
+    alert(result.message);
+    window.location.reload();
+  } catch (e) { alert(e.message); }
+}
+
+async function closePurchaseOrder(lineId) {
+  if (!confirm("Close this PO line? Closed lines cannot be matched to new scans or receive more stock.")) return;
+  try {
+    const result = await poRequest('/purchase-orders/' + lineId + '/close', 'POST', {});
+    alert(result.message);
+    window.location.reload();
+  } catch (e) { alert(e.message); }
+}
 
 function toggleTorch() {
   if (!videoTrack) return;
@@ -709,11 +871,159 @@ function clearDB() {
 </html>
 """
 
+def record_po_event(conn, po_rowid, po_id, event_type, note="", details=None):
+    conn.execute(
+        """INSERT INTO purchase_order_events
+           (po_rowid, po_id, event_type, operator, event_at, note, details_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (po_rowid, str(po_id), event_type, current_operator(),
+         datetime.now().isoformat(timespec="seconds"),
+         note.strip() if isinstance(note, str) else "",
+         json.dumps(details or {}, sort_keys=True, ensure_ascii=False))
+    )
+
+
+def get_purchase_orders():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT rowid AS line_id, * FROM pending_orders ORDER BY order_date DESC, po_id, item_name"
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["remaining_qty"] = max(0, int(item["ordered_qty"]) - int(item["received_qty"]))
+        item["line_status"] = (
+            item["status"] if item["status"] == "CLOSED" else
+            ("COMPLETE" if item["remaining_qty"] == 0 else "OPEN")
+        )
+        result.append(item)
+    return result
+
+
+def get_purchase_order_events(limit=100):
+    limit = max(1, min(int(limit), 500))
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM purchase_order_events ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def _po_text(data, key, required=False, max_length=160):
+    value = data.get(key, "")
+    if value is None:
+        value = ""
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be text.")
+    value = value.strip()
+    if required and not value:
+        raise ValueError(f"{key} is required.")
+    if len(value) > max_length:
+        raise ValueError(f"{key} must be at most {max_length} characters.")
+    return value
+
+
+def _po_quantity(value, key, minimum=1, maximum=1000000):
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be a whole number.")
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str) and re.fullmatch(r"\\d+", value.strip()):
+        number = int(value.strip())
+    else:
+        raise ValueError(f"{key} must be a whole number.")
+    if not minimum <= number <= maximum:
+        raise ValueError(f"{key} must be between {minimum} and {maximum}.")
+    return number
+
+
+def _po_amount(value, key="expected_mrp"):
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be a positive amount.")
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be a positive amount.")
+    if not (0 < amount <= 1000000):
+        raise ValueError(f"{key} must be greater than 0 and at most 1,000,000.")
+    return round(amount, 2)
+
+
+def _po_date(data, key):
+    value = _po_text(data, key, max_length=10)
+    if not value:
+        return ""
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError(f"{key} must use YYYY-MM-DD.")
+    return value
+
+
+def _normalize_po_line(data):
+    if not isinstance(data, dict):
+        raise ValueError("Each purchase-order line must be a JSON object.")
+    values = {
+        "po_id": _po_text(data, "po_id", True, 40),
+        "supplier": _po_text(data, "supplier", True, 120),
+        "item_name": _po_text(data, "item_name", True, 120),
+        "expected_batch": _po_text(data, "expected_batch", True, 40),
+        "expected_mrp": _po_amount(data.get("expected_mrp")),
+        "ordered_qty": _po_quantity(data.get("ordered_qty"), "ordered_qty"),
+        "supplier_contact": _po_text(data, "supplier_contact", False, 100),
+        "supplier_phone": _po_text(data, "supplier_phone", False, 30),
+        "supplier_email": _po_text(data, "supplier_email", False, 160),
+        "order_date": _po_date(data, "order_date"),
+        "expected_delivery": _po_date(data, "expected_delivery"),
+        "notes": _po_text(data, "notes", False, 500),
+    }
+    if values["order_date"] and values["expected_delivery"] and values["expected_delivery"] < values["order_date"]:
+        raise ValueError("expected_delivery cannot be earlier than order_date.")
+    return values
+
+
+def _insert_po_line(conn, values):
+    duplicate = conn.execute(
+        """SELECT rowid FROM pending_orders
+           WHERE UPPER(TRIM(po_id))=UPPER(TRIM(?))
+             AND UPPER(TRIM(item_name))=UPPER(TRIM(?))
+             AND UPPER(TRIM(expected_batch))=UPPER(TRIM(?))""",
+        (values["po_id"], values["item_name"], values["expected_batch"])
+    ).fetchone()
+    if duplicate:
+        raise ValueError(
+            f"Duplicate purchase-order line: {values['po_id']} / {values['item_name']} / {values['expected_batch']}."
+        )
+    now = datetime.now().isoformat(timespec="seconds")
+    cursor = conn.execute(
+        """INSERT INTO pending_orders
+           (po_id, supplier, item_name, expected_batch, expected_mrp, ordered_qty, received_qty,
+            supplier_contact, supplier_phone, supplier_email, order_date, expected_delivery,
+            notes, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)""",
+        (values["po_id"], values["supplier"], values["item_name"], values["expected_batch"],
+         values["expected_mrp"], values["ordered_qty"], values["supplier_contact"],
+         values["supplier_phone"], values["supplier_email"], values["order_date"],
+         values["expected_delivery"], values["notes"], now, now)
+    )
+    line_id = cursor.lastrowid
+    record_po_event(conn, line_id, values["po_id"], "PO_LINE_CREATED", "", values)
+    return line_id
+
+
+def _po_line_dict(conn, line_id):
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT rowid AS line_id, * FROM pending_orders WHERE rowid=?", (line_id,)).fetchone()
+    return dict(row) if row else None
+
+
 @app.route("/")
 def index():
     return render_template_string(
-        HTML_UI, scans=get_all_scans(), pending_pos=get_pending_orders(),
-        review_events=get_review_events(100)
+        HTML_UI, scans=get_all_scans(), pending_pos=get_purchase_orders(),
+        review_events=get_review_events(100), po_events=get_purchase_order_events(50)
     )
 
 @app.route("/scan", methods=["POST"])
@@ -805,7 +1115,7 @@ def update():
                 """SELECT rowid FROM pending_orders
                    WHERE UPPER(TRIM(expected_batch))=UPPER(TRIM(?))
                      AND expected_mrp IS NOT NULL AND ABS(expected_mrp-?) < 0.005
-                     AND received_qty < ordered_qty
+                     AND received_qty < ordered_qty AND status='OPEN'
                    ORDER BY rowid LIMIT 1""",
                 (fresh["batch"], fresh["mrp_num"])
             ).fetchone()
@@ -826,6 +1136,203 @@ def update():
         conn.commit()
     status_message = "Correction saved; scan is ready for operator review." if candidate else "Correction saved; scan still requires review."
     return jsonify({"status": "success", "message": status_message, "review_status": new_review_status})
+
+@app.route("/purchase-orders", methods=["GET"])
+def purchase_orders():
+    return jsonify({"purchase_orders": get_purchase_orders()})
+
+
+@app.route("/purchase-orders", methods=["POST"])
+def create_purchase_order():
+    data = request.get_json(silent=True)
+    try:
+        values = _normalize_po_line(data)
+        with sqlite3.connect(DB_PATH) as conn:
+            line_id = _insert_po_line(conn, values)
+            conn.commit()
+        return jsonify({"status": "success", "line_id": line_id, "message": "Purchase-order line created."}), 201
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/purchase-orders/import", methods=["POST"])
+def import_purchase_orders():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or not isinstance(payload.get("csv_text"), str):
+        return jsonify({"error": "csv_text is required."}), 400
+    csv_text = payload["csv_text"]
+    if not csv_text.strip() or len(csv_text.encode("utf-8")) > 1024 * 1024:
+        return jsonify({"error": "CSV must be non-empty and no larger than 1 MiB."}), 400
+    try:
+        reader = csv.DictReader(io.StringIO(csv_text))
+        required = {"po_id", "supplier", "item_name", "expected_batch", "expected_mrp", "ordered_qty"}
+        headers = set(reader.fieldnames or [])
+        if not required.issubset(headers):
+            return jsonify({"error": "CSV is missing required headers: " + ", ".join(sorted(required - headers))}), 400
+        rows = list(reader)
+        if not rows or len(rows) > 500:
+            return jsonify({"error": "CSV must contain between 1 and 500 data rows."}), 400
+        normalized = []
+        seen = set()
+        for index, row in enumerate(rows, start=2):
+            try:
+                values = _normalize_po_line(row)
+            except ValueError as exc:
+                raise ValueError(f"CSV row {index}: {exc}")
+            key = (values["po_id"].casefold(), values["item_name"].casefold(), values["expected_batch"].casefold())
+            if key in seen:
+                raise ValueError(f"CSV row {index}: duplicate PO line in the uploaded file.")
+            seen.add(key)
+            normalized.append(values)
+        with sqlite3.connect(DB_PATH) as conn:
+            line_ids = []
+            for index, values in enumerate(normalized, start=2):
+                try:
+                    line_ids.append(_insert_po_line(conn, values))
+                except ValueError as exc:
+                    raise ValueError(f"CSV row {index}: {exc}")
+            conn.commit()
+        return jsonify({"status": "success", "imported": len(line_ids), "line_ids": line_ids,
+                        "message": f"Imported {len(line_ids)} purchase-order lines."}), 201
+    except (ValueError, csv.Error) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/purchase-orders/<int:line_id>", methods=["PUT"])
+def update_purchase_order(line_id):
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not data:
+        return jsonify({"error": "A non-empty JSON object is required."}), 400
+    allowed_text = {
+        "supplier": (120, True), "supplier_contact": (100, False),
+        "supplier_phone": (30, False), "supplier_email": (160, False),
+        "item_name": (120, True), "expected_batch": (40, True),
+        "order_date": (10, False), "expected_delivery": (10, False),
+        "notes": (500, False)
+    }
+    allowed = set(allowed_text) | {"expected_mrp", "ordered_qty"}
+    if set(data) - allowed:
+        return jsonify({"error": "One or more fields are not editable."}), 400
+    try:
+        updates = {}
+        for key, value in data.items():
+            if key in allowed_text:
+                maximum, required = allowed_text[key]
+                if key in {"order_date", "expected_delivery"}:
+                    updates[key] = _po_date({key: value}, key)
+                else:
+                    updates[key] = _po_text({key: value}, key, required, maximum)
+            elif key == "expected_mrp":
+                updates[key] = _po_amount(value)
+            elif key == "ordered_qty":
+                updates[key] = _po_quantity(value, key)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT rowid AS line_id, * FROM pending_orders WHERE rowid=?", (line_id,)).fetchone()
+            if row is None:
+                return jsonify({"error": "Purchase-order line not found."}), 404
+            before = {key: row[key] for key in updates}
+            identity_fields = {"po_id", "item_name", "expected_batch", "expected_mrp"}
+            identity_changed = any(before.get(key) != value for key, value in updates.items() if key in identity_fields)
+            linked_scans = conn.execute(
+                "SELECT COUNT(*) FROM scans WHERE matched_po_rowid=?", (line_id,)
+            ).fetchone()[0]
+            if identity_changed and (int(row["received_qty"]) > 0 or linked_scans > 0):
+                return jsonify({"error": "Item, batch and MRP are locked after a scan is linked or any quantity is received."}), 409
+            new_ordered = updates.get("ordered_qty", int(row["ordered_qty"]))
+            if new_ordered < int(row["received_qty"]):
+                return jsonify({"error": "Ordered quantity cannot be lower than quantity already received."}), 400
+            new_order_date = updates.get("order_date", row["order_date"])
+            new_delivery = updates.get("expected_delivery", row["expected_delivery"])
+            if new_order_date and new_delivery and new_delivery < new_order_date:
+                return jsonify({"error": "Expected delivery cannot be earlier than order date."}), 400
+            now = datetime.now().isoformat(timespec="seconds")
+            updates["updated_at"] = now
+            assignments = ", ".join(f"{key}=?" for key in updates)
+            conn.execute(f"UPDATE pending_orders SET {assignments} WHERE rowid=?",
+                         (*updates.values(), line_id))
+            conn.execute(
+                """UPDATE pending_orders SET status=CASE
+                     WHEN status='CLOSED' THEN 'CLOSED'
+                     WHEN received_qty >= ordered_qty THEN 'COMPLETE'
+                     ELSE 'OPEN' END
+                   WHERE rowid=?""", (line_id,)
+            )
+            after = {key: updates[key] for key in updates}
+            record_po_event(conn, line_id, row["po_id"], "PO_LINE_UPDATED", "",
+                            {"before": before, "after": after})
+            conn.commit()
+        return jsonify({"status": "success", "message": "Purchase-order line updated."})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/purchase-orders/<int:line_id>/receive", methods=["POST"])
+def receive_purchase_order(line_id):
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "A JSON object is required."}), 400
+    try:
+        quantity = _po_quantity(data.get("quantity"), "quantity")
+        note = _po_text(data, "note", True, 500)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT rowid AS line_id, * FROM pending_orders WHERE rowid=?", (line_id,)).fetchone()
+        if row is None:
+            return jsonify({"error": "Purchase-order line not found."}), 404
+        if row["status"] != "OPEN":
+            return jsonify({"error": "Only OPEN purchase-order lines can receive stock."}), 409
+        remaining = int(row["ordered_qty"]) - int(row["received_qty"])
+        if quantity > remaining:
+            return jsonify({"error": f"Quantity exceeds remaining ordered quantity ({remaining})."}), 400
+        new_received = int(row["received_qty"]) + quantity
+        new_status = "COMPLETE" if new_received == int(row["ordered_qty"]) else "OPEN"
+        now = datetime.now().isoformat(timespec="seconds")
+        conn.execute(
+            "UPDATE pending_orders SET received_qty=?, status=?, updated_at=? WHERE rowid=?",
+            (new_received, new_status, now, line_id)
+        )
+        record_po_event(
+            conn, line_id, row["po_id"], "PO_PARTIAL_RECEIPT" if new_status == "OPEN" else "PO_FULL_RECEIPT",
+            note, {"quantity": quantity, "previous_received": row["received_qty"],
+                   "new_received": new_received, "ordered_qty": row["ordered_qty"],
+                   "remaining_qty": int(row["ordered_qty"]) - new_received}
+        )
+        conn.commit()
+    return jsonify({"status": "success", "received_qty": new_received, "remaining_qty": int(row["ordered_qty"]) - new_received,
+                    "message": f"Recorded {quantity} received unit(s). Remaining: {int(row['ordered_qty']) - new_received}."})
+
+
+@app.route("/purchase-orders/<int:line_id>/close", methods=["POST"])
+def close_purchase_order(line_id):
+    data = request.get_json(silent=True)
+    note = ""
+    if isinstance(data, dict):
+        note = data.get("note", "")
+    if not isinstance(note, str) or len(note) > 500:
+        return jsonify({"error": "note must be text of at most 500 characters."}), 400
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT rowid AS line_id, * FROM pending_orders WHERE rowid=?", (line_id,)).fetchone()
+        if row is None:
+            return jsonify({"error": "Purchase-order line not found."}), 404
+        if row["status"] != "OPEN":
+            return jsonify({"error": "Only OPEN purchase-order lines can be closed."}), 409
+        now = datetime.now().isoformat(timespec="seconds")
+        conn.execute("UPDATE pending_orders SET status='CLOSED', updated_at=? WHERE rowid=?", (now, line_id))
+        record_po_event(conn, line_id, row["po_id"], "PO_LINE_CLOSED", note,
+                        {"ordered_qty": row["ordered_qty"], "received_qty": row["received_qty"],
+                         "remaining_qty": int(row["ordered_qty"]) - int(row["received_qty"])})
+        conn.commit()
+    return jsonify({"status": "success", "message": "Purchase-order line closed."})
+
+
+@app.route("/purchase-orders/events", methods=["GET"])
+def purchase_order_events():
+    return jsonify({"events": get_purchase_order_events(500)})
+
 
 @app.route("/audit", methods=["GET"])
 def audit():
