@@ -82,6 +82,7 @@ def init_db():
             ("expected_delivery", "TEXT NOT NULL DEFAULT ''"),
             ("notes", "TEXT NOT NULL DEFAULT ''"),
             ("status", "TEXT NOT NULL DEFAULT 'OPEN'"),
+            ("receiving_mode", "TEXT NOT NULL DEFAULT 'UNSET'"),
             ("created_at", "TEXT NOT NULL DEFAULT ''"),
             ("updated_at", "TEXT NOT NULL DEFAULT ''"),
         ):
@@ -176,7 +177,7 @@ def insert_scan(rec):
             inventory_status = "EXPIRED - DO NOT RECEIVE"
         if rec.get("data_valid") and not already_expired:
             matches = cur.execute(
-                """SELECT rowid, expected_mrp, ordered_qty, received_qty
+                """SELECT rowid, expected_mrp, ordered_qty, received_qty, receiving_mode
                    FROM pending_orders WHERE UPPER(TRIM(expected_batch)) = UPPER(TRIM(?)) AND status='OPEN'""",
                 (rec["batch"],)
             ).fetchall()
@@ -187,11 +188,18 @@ def insert_scan(rec):
             elif not exact:
                 inventory_status = "MRP MISMATCH"
             else:
-                available = next((row for row in exact if row[3] < row[2]), None)
+                eligible = [row for row in exact if row[4] in {"UNSET", "SCAN"}]
+                available = next((row for row in eligible if row[3] < row[2]), None)
                 if available:
                     inventory_status = "MATCH CANDIDATE"
                     matched_po_rowid = available[0]
                     review_status = "PENDING"
+                    cur.execute(
+                        "UPDATE pending_orders SET receiving_mode='SCAN', updated_at=? WHERE rowid=? AND receiving_mode='UNSET'",
+                        (datetime.now().isoformat(timespec="seconds"), matched_po_rowid)
+                    )
+                elif not eligible:
+                    inventory_status = "MANUAL RECEIVING MODE"
                 else:
                     inventory_status = "ORDER QUANTITY REACHED"
         rec["inventory_status"] = inventory_status
@@ -257,14 +265,14 @@ def review_scan(scan_id, decision, note=""):
             """UPDATE pending_orders SET received_qty = received_qty + 1
                WHERE rowid = ? AND UPPER(TRIM(expected_batch)) = UPPER(TRIM(?))
                  AND expected_mrp IS NOT NULL AND ABS(expected_mrp - ?) < 0.005
-                 AND received_qty < ordered_qty AND status='OPEN'""",
+                 AND received_qty < ordered_qty AND status='OPEN' AND receiving_mode='SCAN'""",
             (po_rowid, scan["batch"], scan["mrp_num"])
         )
         if cur.rowcount != 1:
             return False, "Purchase order no longer matches or its ordered quantity is already reached."
         conn.execute(
             """UPDATE pending_orders SET status='COMPLETE', updated_at=?
-               WHERE rowid=? AND received_qty >= ordered_qty AND status='OPEN'""",
+               WHERE rowid=? AND received_qty >= ordered_qty AND status='OPEN' AND receiving_mode='SCAN'""",
             (datetime.now().isoformat(timespec="seconds"), po_rowid)
         )
         record_po_event(
@@ -605,7 +613,7 @@ HTML_UI = """
           <td>{{ po.received_qty }}</td>
           <td>{{ po.remaining_qty }}</td>
           <td>{{ po.expected_delivery or "—" }}</td>
-          <td>{{ po.line_status }}</td>
+          <td>{{ po.line_status }}<br><small>{{ po.receiving_mode }}</small></td>
           <td>
             {% if po.line_status == 'OPEN' %}
             <button class="po-button" onclick="receivePurchaseOrder({{ po.line_id }})">Receive</button>
@@ -1001,8 +1009,8 @@ def _insert_po_line(conn, values):
         """INSERT INTO pending_orders
            (po_id, supplier, item_name, expected_batch, expected_mrp, ordered_qty, received_qty,
             supplier_contact, supplier_phone, supplier_email, order_date, expected_delivery,
-            notes, status, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)""",
+            notes, status, receiving_mode, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 'OPEN', 'UNSET', ?, ?)""",
         (values["po_id"], values["supplier"], values["item_name"], values["expected_batch"],
          values["expected_mrp"], values["ordered_qty"], values["supplier_contact"],
          values["supplier_phone"], values["supplier_email"], values["order_date"],
@@ -1116,9 +1124,15 @@ def update():
                    WHERE UPPER(TRIM(expected_batch))=UPPER(TRIM(?))
                      AND expected_mrp IS NOT NULL AND ABS(expected_mrp-?) < 0.005
                      AND received_qty < ordered_qty AND status='OPEN'
+                     AND receiving_mode IN ('UNSET', 'SCAN')
                    ORDER BY rowid LIMIT 1""",
                 (fresh["batch"], fresh["mrp_num"])
             ).fetchone()
+            if candidate:
+                conn.execute(
+                    "UPDATE pending_orders SET receiving_mode='SCAN', updated_at=? WHERE rowid=? AND receiving_mode='UNSET'",
+                    (datetime.now().isoformat(timespec="seconds"), candidate["rowid"])
+                )
         new_review_status = "PENDING" if candidate else "NEEDS REVIEW"
         updated_action = "CORRECTED - READY FOR REVIEW" if candidate else (
             "EXPIRED - DO NOT RECEIVE" if expired else "REVIEW REQUIRED"
@@ -1284,6 +1298,8 @@ def receive_purchase_order(line_id):
             return jsonify({"error": "Purchase-order line not found."}), 404
         if row["status"] != "OPEN":
             return jsonify({"error": "Only OPEN purchase-order lines can receive stock."}), 409
+        if row["receiving_mode"] == "SCAN":
+            return jsonify({"error": "This PO line is assigned to camera-scan receiving. Do not record the same delivery manually."}), 409
         remaining = int(row["ordered_qty"]) - int(row["received_qty"])
         if quantity > remaining:
             return jsonify({"error": f"Quantity exceeds remaining ordered quantity ({remaining})."}), 400
@@ -1291,7 +1307,7 @@ def receive_purchase_order(line_id):
         new_status = "COMPLETE" if new_received == int(row["ordered_qty"]) else "OPEN"
         now = datetime.now().isoformat(timespec="seconds")
         conn.execute(
-            "UPDATE pending_orders SET received_qty=?, status=?, updated_at=? WHERE rowid=?",
+            "UPDATE pending_orders SET received_qty=?, status=?, receiving_mode='MANUAL', updated_at=? WHERE rowid=?",
             (new_received, new_status, now, line_id)
         )
         record_po_event(
