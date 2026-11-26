@@ -31,6 +31,7 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
         with sqlite3.connect(aoi.DB_PATH) as conn:
             conn.execute("DELETE FROM scans")
             conn.execute("DELETE FROM sqlite_sequence WHERE name='scans'")
+            conn.execute("UPDATE pending_orders SET received_qty = 12")
             conn.commit()
         self.client = aoi.app.test_client()
 
@@ -137,7 +138,7 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
         self.assertEqual(record["action"], "REVIEW REQUIRED")
         self.assertEqual(record["inventory_status"], "REVIEW REQUIRED")
 
-    def test_only_exact_batch_and_mrp_match_increments_received_quantity(self):
+    def test_purchase_order_changes_only_after_operator_approval(self):
         before = aoi.get_pending_orders()[0]["received_qty"]
         record = {
             "time": "12:00:00", "brand": "Test", "barcode": "123",
@@ -145,16 +146,60 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
             "mrp": "Rs.100.00", "mrp_num": 100.0, "action": "FRESH",
             "status_code": "PASS", "task_status": "TEST", "data_valid": True,
         }
-        aoi.insert_scan(record)
-        after_match = aoi.get_pending_orders()[0]["received_qty"]
-        self.assertEqual(after_match, before + 1)
-        self.assertEqual(record["inventory_status"], "MATCHED")
+        scan_id = aoi.insert_scan(record)
+        self.assertEqual(aoi.get_pending_orders()[0]["received_qty"], before)
+        with sqlite3.connect(aoi.DB_PATH) as conn:
+            status = conn.execute("SELECT review_status FROM scans WHERE id=?", (scan_id,)).fetchone()[0]
+        self.assertEqual(status, "PENDING")
 
-        mismatch = dict(record, mrp_num=125.0, mrp="Rs.125.00", time="12:01:00")
-        aoi.insert_scan(mismatch)
-        after_mismatch = aoi.get_pending_orders()[0]["received_qty"]
-        self.assertEqual(after_mismatch, after_match)
-        self.assertEqual(mismatch["inventory_status"], "MRP MISMATCH")
+        ok, message = aoi.review_scan(scan_id, "approve", "Physical label and unit checked")
+        self.assertTrue(ok, message)
+        self.assertEqual(aoi.get_pending_orders()[0]["received_qty"], before + 1)
+        ok, message = aoi.review_scan(scan_id, "approve")
+        self.assertFalse(ok)
+        self.assertEqual(aoi.get_pending_orders()[0]["received_qty"], before + 1)
+
+    def test_mrp_mismatch_cannot_be_approved_or_change_stock(self):
+        before = aoi.get_pending_orders()[0]["received_qty"]
+        record = {
+            "time": "12:01:00", "brand": "Test", "barcode": "123",
+            "batch": "GL-26105", "mfr": "04/2026", "exp": "03/2028",
+            "mrp": "Rs.125.00", "mrp_num": 125.0, "action": "FRESH",
+            "status_code": "PASS", "task_status": "TEST", "data_valid": True,
+        }
+        scan_id = aoi.insert_scan(record)
+        self.assertEqual(record["inventory_status"], "MRP MISMATCH")
+        ok, _ = aoi.review_scan(scan_id, "approve")
+        self.assertFalse(ok)
+        self.assertEqual(aoi.get_pending_orders()[0]["received_qty"], before)
+
+    def test_rejected_scan_does_not_change_received_quantity(self):
+        before = aoi.get_pending_orders()[0]["received_qty"]
+        record = {
+            "time": "12:02:00", "brand": "Test", "barcode": "123",
+            "batch": "GL-26105", "mfr": "04/2026", "exp": "03/2028",
+            "mrp": "Rs.100.00", "mrp_num": 100.0, "action": "FRESH",
+            "status_code": "PASS", "task_status": "TEST", "data_valid": True,
+        }
+        scan_id = aoi.insert_scan(record)
+        ok, _ = aoi.review_scan(scan_id, "reject", "Wrong physical item")
+        self.assertTrue(ok)
+        self.assertEqual(aoi.get_pending_orders()[0]["received_qty"], before)
+
+    def test_review_endpoint_validates_and_approves(self):
+        record = {
+            "time": "12:03:00", "brand": "Test", "barcode": "123",
+            "batch": "GL-26105", "mfr": "04/2026", "exp": "03/2028",
+            "mrp": "Rs.100.00", "mrp_num": 100.0, "action": "FRESH",
+            "status_code": "PASS", "task_status": "TEST", "data_valid": True,
+        }
+        scan_id = aoi.insert_scan(record)
+        response = self.client.post("/review", json={
+            "id": scan_id, "decision": "approve", "note": "Checked"
+        })
+        self.assertEqual(response.status_code, 200)
+        invalid = self.client.post("/review", json={"id": scan_id, "decision": "approve"})
+        self.assertEqual(invalid.status_code, 409)
 
     def test_invalid_or_unverified_scan_never_increments_purchase_order(self):
         before = aoi.get_pending_orders()[0]["received_qty"]
