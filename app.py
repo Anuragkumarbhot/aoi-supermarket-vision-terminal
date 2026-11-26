@@ -1305,7 +1305,6 @@ def receive_purchase_order(line_id):
         return jsonify({"error": str(exc)}), 400
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("BEGIN IMMEDIATE")
-        conn.row_factory = sqlite3.Row    with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT rowid AS line_id, * FROM pending_orders WHERE rowid=?", (line_id,)).fetchone()
         if row is None:
