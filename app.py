@@ -1,4 +1,5 @@
 import os, re, io, csv, json, base64, sqlite3, subprocess, tempfile, urllib.request, threading
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image, ImageOps, ImageStat, ImageDraw, ImageFilter
 from datetime import datetime
@@ -11,9 +12,12 @@ except ImportError:
     HAS_ZBAR = False
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # Limit request bodies to 8 MiB.
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inventory_audit.db")
-SALES_SERVER_URL = os.environ.get("SALES_SERVER_URL", "https://api.supermarket-erp.com/v1/stock")
+# External sync is deliberately disabled until BOTH settings are supplied.
+SALES_SERVER_URL = os.environ.get("AOI_SALES_SYNC_URL", "").strip()
+SALES_SERVER_TOKEN = os.environ.get("AOI_SALES_SYNC_TOKEN", "").strip()
 executor = ThreadPoolExecutor(max_workers=3)
 
 def init_db():
@@ -80,19 +84,34 @@ def get_pending_orders():
         return [dict(r) for r in rows]
 
 def sync_to_sales_server(record):
+    # Never send inventory data unless the operator explicitly configures both
+    # an HTTPS endpoint and a bearer token through the environment.
+    if not SALES_SERVER_URL or not SALES_SERVER_TOKEN:
+        return False
+
+    parsed_url = urlparse(SALES_SERVER_URL)
+    if parsed_url.scheme != "https" or not parsed_url.netloc:
+        app.logger.error("AOI sales sync disabled: AOI_SALES_SYNC_URL must be a valid HTTPS URL.")
+        return False
+
     def _worker():
         try:
             payload = json.dumps(record).encode("utf-8")
             req = urllib.request.Request(
                 SALES_SERVER_URL, data=payload,
-                headers={"Content-Type": "application/json", "Authorization": "Bearer STORE_TOKEN_123"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {SALES_SERVER_TOKEN}",
+                },
                 method="POST"
             )
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                pass
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status < 200 or resp.status >= 300:
+                    app.logger.warning("AOI sales sync returned HTTP %s.", resp.status)
         except Exception:
-            pass
+            app.logger.exception("AOI sales sync failed.")
     threading.Thread(target=_worker, daemon=True).start()
+    return True
 
 # --- v3.0 NEURAL & MULTI-TASKING PIPELINE WORKERS ---
 def neural_detect_stamp_region(pil_img):
@@ -442,10 +461,31 @@ def index():
 
 @app.route("/scan", methods=["POST"])
 def scan():
-    payload = request.get_json()
-    b64_str = payload["image"].split(",")[1]
-    pil_img = Image.open(io.BytesIO(base64.b64decode(b64_str)))
-    record = multi_task_neural_pipeline(pil_img, payload.get("brand", "Gericon Pharma Syrup"))
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "A JSON object is required."}), 400
+
+    image_data = payload.get("image")
+    if not isinstance(image_data, str) or not image_data.startswith("data:image/"):
+        return jsonify({"error": "A valid image data URL is required."}), 400
+
+    try:
+        header, encoded = image_data.split(",", 1)
+        raw_image = base64.b64decode(encoded, validate=True)
+        if not raw_image:
+            raise ValueError("Empty image")
+        with Image.open(io.BytesIO(raw_image)) as probe:
+            probe.verify()
+        pil_img = Image.open(io.BytesIO(raw_image)).convert("RGB")
+    except Exception:
+        return jsonify({"error": "The uploaded image is invalid or unsupported."}), 400
+
+    brand = payload.get("brand", "Gericon Pharma Syrup")
+    if not isinstance(brand, str):
+        return jsonify({"error": "Product name must be text."}), 400
+    brand = brand.strip()[:120] or "Unspecified product"
+
+    record = multi_task_neural_pipeline(pil_img, brand)
     return jsonify(record)
 
 @app.route("/update", methods=["POST"])
@@ -519,4 +559,16 @@ def export_csv():
 
 if __name__ == "__main__":
     init_db()
-    app.run(host="0.0.0.0", port=5000)
+    host = os.environ.get("AOI_HOST", "127.0.0.1").strip()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        raise SystemExit(
+            "Refusing non-localhost binding. Keep AOI_HOST at 127.0.0.1; "
+            "use a separately authenticated and TLS-terminated reverse proxy for remote access."
+        )
+    try:
+        port = int(os.environ.get("AOI_PORT", "5000"))
+    except ValueError:
+        raise SystemExit("AOI_PORT must be an integer between 1 and 65535.")
+    if not 1 <= port <= 65535:
+        raise SystemExit("AOI_PORT must be an integer between 1 and 65535.")
+    app.run(host=host, port=port)
