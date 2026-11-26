@@ -650,6 +650,7 @@ HTML_UI = """
       <input name="item_name" placeholder="Item / product *" required maxlength="120">
       <input name="expected_batch" placeholder="Expected batch *" required maxlength="40">
       <input name="expected_mrp" type="number" step="0.01" min="0.01" placeholder="Expected MRP *" required>
+      <input name="expected_unit_cost" type="number" step="0.01" min="0.01" placeholder="Expected purchase cost (optional)">
       <input name="ordered_qty" type="number" step="1" min="1" placeholder="Ordered qty *" required>
       <input name="supplier_contact" placeholder="Contact person">
       <input name="supplier_phone" placeholder="Supplier phone">
@@ -673,7 +674,7 @@ HTML_UI = """
         <tr>
           <td><b>{{ po.po_id }}</b><br>{{ po.supplier }}<br><small>{{ po.supplier_contact }} {{ po.supplier_phone }}<br>{{ po.supplier_email }}</small></td>
           <td>{{ po.item_name }}<br><small>{{ po.expected_batch }}</small></td>
-          <td>Rs.{{ "%.2f"|format(po.expected_mrp) }}</td>
+          <td>MRP Rs.{{ "%.2f"|format(po.expected_mrp) }}<br><small>Cost {{ ("Rs.%.2f"|format(po.expected_unit_cost)) if po.expected_unit_cost else "Not set" }}</small></td>
           <td>{{ po.ordered_qty }}</td>
           <td>{{ po.received_qty }}</td>
           <td>{{ po.remaining_qty }}</td>
@@ -692,6 +693,30 @@ HTML_UI = """
         {% endfor %}
       </tbody>
     </table>
+  </div>
+  <div class="table-wrap" style="padding:8px;text-align:left;">
+    <div style="font-size:12px;font-weight:800;color:#FBBF24;margin-bottom:8px;">📥 GOODS RECEIPT NOTES & SUPPLIER INVOICES</div>
+    <p style="font-size:11px;color:#94A3B8;">Use the same delivery reference on the manual receipt and supplier invoice. Invoice unit cost is compared only when expected purchase cost was entered on the PO; MRP is not treated as supplier cost.</p>
+    <textarea id="supplierInvoiceJson" rows="7" style="width:100%;box-sizing:border-box;background:#0B1220;color:#E2E8F0;border:1px solid var(--border);border-radius:6px;padding:7px;font-size:11px;" placeholder='{"invoice_number":"INV-1001","supplier":"North Distributor","invoice_date":"2026-11-27","delivery_ref":"DC-1001","invoice_total":2510,"lines":[{"po_line_id":1,"quantity":20,"unit_cost":125.5}]}'></textarea>
+    <button class="po-button" onclick="submitSupplierInvoice()">＋ Record & reconcile invoice</button>
+    <a href="/goods-receipts" style="font-size:11px;margin-left:8px;">GRN JSON</a>
+    <a href="/supplier-invoices" style="font-size:11px;margin-left:8px;">Invoice JSON</a>
+  </div>
+  <div class="table-wrap">
+    <div style="background:#090D16;padding:5px;font-size:10px;font-weight:bold;color:#FBBF24;border-bottom:1px solid var(--border);">📥 RECENT GOODS RECEIPTS</div>
+    <table><thead><tr><th>Date</th><th>PO / Supplier</th><th>Delivery Ref</th><th>Qty</th><th>Batch / MRP</th><th>Source</th></tr></thead><tbody>
+    {% for grn in goods_receipts %}
+      <tr><td>{{ grn.received_at }}</td><td>{{ grn.po_id }}<br>{{ grn.supplier or "" }}<br><small>{{ grn.item_name or "" }}</small></td><td>{{ grn.delivery_ref }}</td><td>{{ grn.quantity }}</td><td>{{ grn.actual_batch }} / {{ grn.actual_mrp }}</td><td>{{ grn.source }}</td></tr>
+    {% else %}<tr><td colspan="6">No GRN entries yet.</td></tr>{% endfor %}
+    </tbody></table>
+  </div>
+  <div class="table-wrap">
+    <div style="background:#090D16;padding:5px;font-size:10px;font-weight:bold;color:#FBBF24;border-bottom:1px solid var(--border);">🧾 SUPPLIER INVOICE RECONCILIATION</div>
+    <table><thead><tr><th>Invoice</th><th>Supplier</th><th>Date / Delivery Ref</th><th>Total</th><th>Status</th><th>Action</th></tr></thead><tbody>
+    {% for inv in supplier_invoices %}
+      <tr><td>{{ inv.invoice_number }}</td><td>{{ inv.supplier }}</td><td>{{ inv.invoice_date }}<br>{{ inv.delivery_ref }}</td><td>Rs.{{ "%.2f"|format(inv.invoice_total) }}</td><td>{{ inv.status }}</td><td><button class="po-button" onclick="reconcileSupplierInvoice({{ inv.id }})">Reconcile</button></td></tr>
+    {% else %}<tr><td colspan="6">No supplier invoices yet.</td></tr>{% endfor %}
+    </tbody></table>
   </div>
   <div class="table-wrap">
     <div style="background:#090D16; padding:5px; font-size:10px; font-weight:bold; color:#FBBF24; border-bottom:1px solid var(--border);">📋 Recent PO Activity</div>
@@ -755,6 +780,28 @@ let videoTrack = null, torchOn = false, autoTimer = null, isScanning = false, ac
 
 navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } } })
 .then(stream => { video.srcObject = stream; videoTrack = stream.getVideoTracks()[0]; }).catch(() => {});
+
+async function submitSupplierInvoice() {
+  const raw = document.getElementById('supplierInvoiceJson').value;
+  let payload;
+  try { payload = JSON.parse(raw); } catch (e) { alert("Invoice JSON is invalid: " + e.message); return; }
+  try {
+    const result = await poRequest('/supplier-invoices', 'POST', payload);
+    const issues = (result.reconciliation.discrepancies || []).map(x =>
+      x.issues ? x.issues.join(", ") : x.issue
+    ).join("; ");
+    alert("Invoice status: " + result.reconciliation.status + (issues ? "\n" + issues : ""));
+    window.location.reload();
+  } catch (e) { alert(e.message); }
+}
+
+async function reconcileSupplierInvoice(invoiceId) {
+  try {
+    const result = await poRequest('/supplier-invoices/' + invoiceId + '/reconcile', 'POST', {});
+    alert("Reconciliation status: " + result.reconciliation.status);
+    window.location.reload();
+  } catch (e) { alert(e.message); }
+}
 
 async function poRequest(url, method, body) {
   const response = await fetch(url, {
@@ -996,6 +1043,16 @@ def record_goods_receipt(conn, po_rowid, po_id, delivery_ref, quantity, actual_b
     )
 
 
+def get_supplier_invoices(limit=100):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM supplier_invoices ORDER BY id DESC LIMIT ?",
+            (max(1, min(int(limit), 500)),)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
 def get_goods_receipts(limit=100):
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
@@ -1190,7 +1247,8 @@ def _po_line_dict(conn, line_id):
 def index():
     return render_template_string(
         HTML_UI, scans=get_all_scans(), pending_pos=get_purchase_orders(),
-        review_events=get_review_events(100), po_events=get_purchase_order_events(50)
+        review_events=get_review_events(100), po_events=get_purchase_order_events(50),
+        goods_receipts=get_goods_receipts(50), supplier_invoices=get_supplier_invoices(100)
     )
 
 @app.route("/scan", methods=["POST"])
