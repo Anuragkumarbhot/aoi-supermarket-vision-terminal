@@ -138,6 +138,10 @@ def init_db():
                 UNIQUE(invoice_number, supplier)
             )
         """)
+        invoice_columns = {row[1] for row in conn.execute("PRAGMA table_info(supplier_invoices)")}
+        for column in ("tax_amount", "other_charges"):
+            if column not in invoice_columns:
+                conn.execute(f"ALTER TABLE supplier_invoices ADD COLUMN {column} REAL NOT NULL DEFAULT 0")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS supplier_invoice_lines (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1076,6 +1080,18 @@ def _invoice_amount(value, key):
     return amount
 
 
+def _invoice_adjustment(value, key):
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be zero or a positive amount.")
+    try:
+        amount = round(float(value or 0), 2)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be zero or a positive amount.")
+    if not (0 <= amount <= 100000000):
+        raise ValueError(f"{key} must be between 0 and 100,000,000.")
+    return amount
+
+
 def reconcile_supplier_invoice(conn, invoice_id):
     invoice = conn.execute(
         "SELECT * FROM supplier_invoices WHERE id=?", (invoice_id,)
@@ -1112,9 +1128,12 @@ def reconcile_supplier_invoice(conn, invoice_id):
         )
         if issues:
             discrepancies.append({"invoice_line_id": line["id"], "po_rowid": line["po_rowid"], "issues": issues})
-    total_issue = abs(invoice_sum - float(invoice["invoice_total"])) >= 0.01
+    calculated_total = round(invoice_sum + float(invoice["tax_amount"] or 0) + float(invoice["other_charges"] or 0), 2)
+    total_issue = abs(calculated_total - float(invoice["invoice_total"])) >= 0.01
     if total_issue:
-        discrepancies.append({"issue": "INVOICE_TOTAL_MISMATCH", "calculated_total": invoice_sum,
+        discrepancies.append({"issue": "INVOICE_TOTAL_MISMATCH", "calculated_total": calculated_total,
+                               "line_subtotal": invoice_sum, "tax_amount": float(invoice["tax_amount"] or 0),
+                               "other_charges": float(invoice["other_charges"] or 0),
                                "invoice_total": float(invoice["invoice_total"])})
     status = "DISCREPANCY" if discrepancies else "MATCHED"
     conn.execute("UPDATE supplier_invoices SET status=? WHERE id=?", (status, invoice_id))
@@ -1125,8 +1144,9 @@ def reconcile_supplier_invoice(conn, invoice_id):
         (invoice_id, datetime.now().isoformat(timespec="seconds"), current_operator(),
          json.dumps({"status": status, "discrepancies": discrepancies}, sort_keys=True))
     )
-    return {"invoice_id": invoice_id, "status": status, "calculated_total": invoice_sum,
-            "invoice_total": float(invoice["invoice_total"]), "discrepancies": discrepancies}
+    return {"invoice_id": invoice_id, "status": status, "line_subtotal": invoice_sum,
+            "calculated_total": calculated_total, "invoice_total": float(invoice["invoice_total"]),
+            "discrepancies": discrepancies}
 
 
 def _po_text(data, key, required=False, max_length=160):
@@ -1661,6 +1681,8 @@ def create_supplier_invoice():
             raise ValueError("invoice_date is required.")
         delivery_ref = _po_text(data, "delivery_ref", True, 100)
         invoice_total = _invoice_amount(data.get("invoice_total"), "invoice_total")
+        tax_amount = _invoice_adjustment(data.get("tax_amount", 0), "tax_amount")
+        other_charges = _invoice_adjustment(data.get("other_charges", 0), "other_charges")
         lines = data.get("lines")
         if not isinstance(lines, list) or not lines or len(lines) > 200:
             raise ValueError("lines must contain between 1 and 200 invoice lines.")
@@ -1679,8 +1701,9 @@ def create_supplier_invoice():
             line_total = round(quantity * unit_cost, 2)
             normalized.append((po_line_id, quantity, unit_cost, line_total))
             calculated += line_total
-        if abs(round(calculated, 2) - invoice_total) >= 0.01:
-            raise ValueError(f"Invoice total does not equal line totals ({round(calculated, 2):.2f}).")
+        calculated_invoice_total = round(calculated + tax_amount + other_charges, 2)
+        if abs(calculated_invoice_total - invoice_total) >= 0.01:
+            raise ValueError(f"Invoice total does not equal line subtotal plus tax and other charges ({calculated_invoice_total:.2f}).")
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.row_factory = sqlite3.Row
@@ -1696,9 +1719,9 @@ def create_supplier_invoice():
             now = datetime.now().isoformat(timespec="seconds")
             cursor = conn.execute(
                 """INSERT INTO supplier_invoices
-                   (invoice_number, supplier, invoice_date, delivery_ref, invoice_total, status, created_at, operator)
-                   VALUES (?, ?, ?, ?, ?, 'UNRECONCILED', ?, ?)""",
-                (invoice_number, supplier, invoice_date, delivery_ref, invoice_total, now, current_operator())
+                   (invoice_number, supplier, invoice_date, delivery_ref, invoice_total, tax_amount, other_charges, status, created_at, operator)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'UNRECONCILED', ?, ?)""",
+                (invoice_number, supplier, invoice_date, delivery_ref, invoice_total, tax_amount, other_charges, now, current_operator())
             )
             invoice_id = cursor.lastrowid
             for po_line_id, quantity, unit_cost, line_total in normalized:
