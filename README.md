@@ -63,7 +63,7 @@ PO-2026-901,North Distributor,Cereal 500g,NC-101,125.50,90.00,20,Ravi,9876543210
 - Use the same delivery reference on the PO receipt and supplier invoice to reconcile the invoice line against the goods physically recorded for that delivery.
 - Add an optional **expected purchase unit cost** to a PO line. This is separate from consumer-facing MRP; invoice unit cost is compared only with this purchase-cost field when it has been configured.
 - Supplier invoice records include invoice number, supplier, date, delivery reference, invoice total and PO-linked lines with invoiced quantity and unit cost.
-- Reconciliation checks supplier identity, invoice quantity against GRN quantity for the delivery reference, expected purchase unit cost (when configured), and invoice header total against calculated line totals.
+- Reconciliation checks supplier identity, invoice quantity against GRN quantity for the delivery reference, expected purchase unit cost (when configured), and invoice header total against line subtotal plus tax and other charges. This supports GST and freight/other charge amounts without comparing supplier cost against retail MRP.
 - Invoices can be reconciled again after a missing GRN is entered. Discrepancies remain visible rather than being silently accepted.
 
 ### API routes
@@ -82,14 +82,16 @@ PO-2026-901,North Distributor,Cereal 500g,NC-101,125.50,90.00,20,Ravi,9876543210
   "supplier": "North Distributor",
   "invoice_date": "2026-11-27",
   "delivery_ref": "DC-1001",
-  "invoice_total": 2510.00,
+  "invoice_total": 2961.80,
+  "tax_amount": 451.80,
+  "other_charges": 0.00,
   "lines": [
     {"po_line_id": 12, "quantity": 20, "unit_cost": 125.50}
   ]
 }
 ```
 
-The `po_line_id` is the numeric line ID shown by `GET /purchase-orders`. The invoice `delivery_ref` must match the GRN delivery reference. A supplier cost is not compared with retail MRP.
+The `po_line_id` is the numeric line ID shown by `GET /purchase-orders`. The invoice `delivery_ref` must match the GRN delivery reference. `tax_amount` and `other_charges` are optional and default to zero. A supplier cost is not compared with retail MRP.
 
 ## Operator review and receiving approval
 
