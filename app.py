@@ -75,6 +75,7 @@ def init_db():
         # Additive migrations keep existing local inventory databases usable.
         po_columns = {row[1] for row in conn.execute("PRAGMA table_info(pending_orders)")}
         for column, definition in (
+            ("expected_unit_cost", "REAL"),
             ("supplier_contact", "TEXT NOT NULL DEFAULT ''"),
             ("supplier_phone", "TEXT NOT NULL DEFAULT ''"),
             ("supplier_email", "TEXT NOT NULL DEFAULT ''"),
@@ -101,6 +102,63 @@ def init_db():
                 operator TEXT NOT NULL,
                 event_at TEXT NOT NULL,
                 note TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}'
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS goods_receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                po_rowid INTEGER NOT NULL,
+                po_id TEXT NOT NULL,
+                delivery_ref TEXT NOT NULL,
+                quantity INTEGER NOT NULL CHECK(quantity > 0),
+                actual_batch TEXT NOT NULL DEFAULT '',
+                actual_mrp REAL,
+                source TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                operator TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_goods_receipts_po_ref
+            ON goods_receipts(po_rowid, delivery_ref)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS supplier_invoices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_number TEXT NOT NULL,
+                supplier TEXT NOT NULL,
+                invoice_date TEXT NOT NULL,
+                delivery_ref TEXT NOT NULL,
+                invoice_total REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'UNRECONCILED',
+                created_at TEXT NOT NULL,
+                operator TEXT NOT NULL,
+                UNIQUE(invoice_number, supplier)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS supplier_invoice_lines (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_id INTEGER NOT NULL,
+                po_rowid INTEGER NOT NULL,
+                po_id TEXT NOT NULL,
+                item_name TEXT NOT NULL,
+                invoiced_qty INTEGER NOT NULL,
+                unit_cost REAL NOT NULL,
+                line_total REAL NOT NULL,
+                reconciliation_status TEXT NOT NULL DEFAULT 'UNRECONCILED',
+                discrepancy_json TEXT NOT NULL DEFAULT '[]'
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS supplier_invoice_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                event_at TEXT NOT NULL,
+                operator TEXT NOT NULL,
                 details_json TEXT NOT NULL DEFAULT '{}'
             )
         """)
@@ -920,6 +978,94 @@ def get_purchase_order_events(limit=100):
             "SELECT * FROM purchase_order_events ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+def record_goods_receipt(conn, po_rowid, po_id, delivery_ref, quantity, actual_batch, actual_mrp, source, note=""):
+    conn.execute(
+        """INSERT INTO goods_receipts
+           (po_rowid, po_id, delivery_ref, quantity, actual_batch, actual_mrp,
+            source, received_at, operator, note)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (po_rowid, str(po_id), delivery_ref.strip(), int(quantity), str(actual_batch or ""),
+         actual_mrp, source, datetime.now().isoformat(timespec="seconds"),
+         current_operator(), note.strip() if isinstance(note, str) else "")
+    )
+
+
+def get_goods_receipts(limit=100):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT gr.*, po.supplier, po.item_name
+               FROM goods_receipts gr LEFT JOIN pending_orders po ON po.rowid=gr.po_rowid
+               ORDER BY gr.id DESC LIMIT ?""", (max(1, min(int(limit), 500)),)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def _invoice_amount(value, key):
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be a positive amount.")
+    try:
+        amount = round(float(value), 2)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be a positive amount.")
+    if not (0 < amount <= 100000000):
+        raise ValueError(f"{key} must be greater than 0 and at most 100,000,000.")
+    return amount
+
+
+def reconcile_supplier_invoice(conn, invoice_id):
+    invoice = conn.execute(
+        "SELECT * FROM supplier_invoices WHERE id=?", (invoice_id,)
+    ).fetchone()
+    if invoice is None:
+        raise ValueError("Supplier invoice not found.")
+    discrepancies = []
+    lines = conn.execute(
+        "SELECT * FROM supplier_invoice_lines WHERE invoice_id=? ORDER BY id", (invoice_id,)
+    ).fetchall()
+    invoice_sum = round(sum(float(line["line_total"]) for line in lines), 2)
+    for line in lines:
+        po = conn.execute(
+            "SELECT * FROM pending_orders WHERE rowid=?", (line["po_rowid"],)
+        ).fetchone()
+        issues = []
+        if po is None:
+            issues.append("PO_LINE_NOT_FOUND")
+        else:
+            if str(po["supplier"]).strip().casefold() != str(invoice["supplier"]).strip().casefold():
+                issues.append("SUPPLIER_MISMATCH")
+            received = conn.execute(
+                """SELECT COALESCE(SUM(quantity),0) FROM goods_receipts
+                   WHERE po_rowid=? AND UPPER(TRIM(delivery_ref))=UPPER(TRIM(?))""",
+                (line["po_rowid"], invoice["delivery_ref"])
+            ).fetchone()[0]
+            if int(received) != int(line["invoiced_qty"]):
+                issues.append("QUANTITY_MISMATCH")
+            if po["expected_unit_cost"] is not None and abs(float(po["expected_unit_cost"]) - float(line["unit_cost"])) >= 0.005:
+                issues.append("UNIT_COST_MISMATCH")
+        conn.execute(
+            "UPDATE supplier_invoice_lines SET reconciliation_status=?, discrepancy_json=? WHERE id=?",
+            ("MATCHED" if not issues else "DISCREPANCY", json.dumps(issues), line["id"])
+        )
+        if issues:
+            discrepancies.append({"invoice_line_id": line["id"], "po_rowid": line["po_rowid"], "issues": issues})
+    total_issue = abs(invoice_sum - float(invoice["invoice_total"])) >= 0.01
+    if total_issue:
+        discrepancies.append({"issue": "INVOICE_TOTAL_MISMATCH", "calculated_total": invoice_sum,
+                               "invoice_total": float(invoice["invoice_total"])})
+    status = "DISCREPANCY" if discrepancies else "MATCHED"
+    conn.execute("UPDATE supplier_invoices SET status=? WHERE id=?", (status, invoice_id))
+    conn.execute(
+        """INSERT INTO supplier_invoice_events
+           (invoice_id, event_type, event_at, operator, details_json)
+           VALUES (?, 'RECONCILED', ?, ?, ?)""",
+        (invoice_id, datetime.now().isoformat(timespec="seconds"), current_operator(),
+         json.dumps({"status": status, "discrepancies": discrepancies}, sort_keys=True))
+    )
+    return {"invoice_id": invoice_id, "status": status, "calculated_total": invoice_sum,
+            "invoice_total": float(invoice["invoice_total"]), "discrepancies": discrepancies}
 
 
 def _po_text(data, key, required=False, max_length=160):
