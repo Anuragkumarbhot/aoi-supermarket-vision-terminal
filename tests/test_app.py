@@ -34,7 +34,7 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
             conn.execute("DELETE FROM scan_review_events")
             conn.execute("DELETE FROM purchase_order_events")
             conn.execute("DELETE FROM pending_orders WHERE po_id <> 'PO-2026-884'")
-            conn.execute("UPDATE pending_orders SET received_qty = 12, status = 'OPEN'")
+            conn.execute("UPDATE pending_orders SET received_qty = 12, status = 'OPEN', receiving_mode = 'UNSET'")
             conn.commit()
         self.client = aoi.app.test_client()
 
@@ -440,6 +440,21 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
         payload["ordered_qty"] = "2.5"
         invalid = self.client.post("/purchase-orders", json=payload)
         self.assertEqual(invalid.status_code, 400)
+
+    def test_purchase_order_rejects_invalid_supplier_email_and_rounded_zero_mrp(self):
+        base = {
+            "po_id": "PO-VALIDATION-001", "supplier": "Vendor",
+            "item_name": "Validation Item", "expected_batch": "VAL-1",
+            "expected_mrp": "0.001", "ordered_qty": 1,
+        }
+        tiny_mrp = self.client.post("/purchase-orders", json=base)
+        self.assertEqual(tiny_mrp.status_code, 400)
+
+        base["po_id"] = "PO-VALIDATION-002"
+        base["expected_mrp"] = "12.50"
+        base["supplier_email"] = "not-an-email"
+        bad_email = self.client.post("/purchase-orders", json=base)
+        self.assertEqual(bad_email.status_code, 400)
 
     def test_purchase_order_csv_import_is_atomic(self):
         csv_text = (
