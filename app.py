@@ -163,6 +163,7 @@ def get_review_events(limit=100):
 def insert_scan(rec):
     """Save a scan for human review; never change received stock automatically."""
     with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("BEGIN IMMEDIATE")
         cur = conn.cursor()
         inventory_status = "REVIEW REQUIRED"
         matched_po_rowid = None
@@ -227,6 +228,7 @@ def review_scan(scan_id, decision, note=""):
     if not isinstance(note, str) or len(note) > 500:
         return False, "Review note must be text of at most 500 characters."
     with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("BEGIN IMMEDIATE")
         conn.row_factory = sqlite3.Row
         scan = conn.execute("SELECT * FROM scans WHERE id = ?", (scan_id,)).fetchone()
         if scan is None:
@@ -1163,6 +1165,8 @@ def create_purchase_order():
     try:
         values = _normalize_po_line(data)
         with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            line_id = _insert_po_line(conn, values)        with sqlite3.connect(DB_PATH) as conn:
             line_id = _insert_po_line(conn, values)
             conn.commit()
         return jsonify({"status": "success", "line_id": line_id, "message": "Purchase-order line created."}), 201
@@ -1200,6 +1204,8 @@ def import_purchase_orders():
             seen.add(key)
             normalized.append(values)
         with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            line_ids = []        with sqlite3.connect(DB_PATH) as conn:
             line_ids = []
             for index, values in enumerate(normalized, start=2):
                 try:
@@ -1245,6 +1251,8 @@ def update_purchase_order(line_id):
             elif key == "ordered_qty":
                 updates[key] = _po_quantity(value, key)
         with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.row_factory = sqlite3.Row        with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute("SELECT rowid AS line_id, * FROM pending_orders WHERE rowid=?", (line_id,)).fetchone()
             if row is None:
@@ -1296,6 +1304,8 @@ def receive_purchase_order(line_id):
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.row_factory = sqlite3.Row    with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT rowid AS line_id, * FROM pending_orders WHERE rowid=?", (line_id,)).fetchone()
         if row is None:
@@ -1340,6 +1350,8 @@ def close_purchase_order(line_id):
     if not isinstance(note, str) or len(note) > 500:
         return jsonify({"error": "note must be text of at most 500 characters."}), 400
     with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.row_factory = sqlite3.Row    with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT rowid AS line_id, * FROM pending_orders WHERE rowid=?", (line_id,)).fetchone()
         if row is None:
