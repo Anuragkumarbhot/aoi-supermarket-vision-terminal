@@ -350,11 +350,36 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
         scan_id = aoi.insert_scan(record)
         response = self.client.post("/delete", json={"id": scan_id})
         self.assertEqual(response.status_code, 200)
-        event_types = [e["event_type"] for e in aoi.get_review_events()]
+        events = aoi.get_review_events()
+        event_types = [e["event_type"] for e in events]
         self.assertIn("SCAN_CAPTURED", event_types)
         self.assertIn("SCAN_DELETED", event_types)
+        deletion = next(e for e in events if e["event_type"] == "SCAN_DELETED")
+        import json
+        details = json.loads(deletion["details_json"])
+        self.assertEqual(details["scan_snapshot"]["brand"], "Test")
         with sqlite3.connect(aoi.DB_PATH) as conn:
             self.assertIsNone(conn.execute("SELECT id FROM scans WHERE id=?", (scan_id,)).fetchone())
+
+    def test_shift_reset_preserves_audit_and_never_reuses_scan_ids(self):
+        record = {
+            "time": "12:18:00", "brand": "First item", "barcode": "123",
+            "batch": "", "mfr": "", "exp": "", "mrp": "", "mrp_num": None,
+            "action": "REVIEW REQUIRED", "status_code": "FAIL",
+            "task_status": "TEST", "data_valid": False,
+        }
+        first_id = aoi.insert_scan(dict(record))
+        response = self.client.post("/clear")
+        self.assertEqual(response.status_code, 200)
+
+        second_record = dict(record, brand="Second item", time="12:19:00")
+        second_id = aoi.insert_scan(second_record)
+        self.assertGreater(second_id, first_id)
+        events = aoi.get_review_events()
+        reset_event = next(e for e in events if e["event_type"] == "SCAN_DELETED_BY_RESET")
+        import json
+        details = json.loads(reset_event["details_json"])
+        self.assertEqual(details["scan_snapshot"]["brand"], "First item")
 
     def test_audit_endpoint_returns_json_events(self):
         record = {
