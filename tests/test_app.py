@@ -573,6 +573,96 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
                     if x["line_id"] == line_id)
         self.assertEqual(line["line_status"], "CLOSED")
 
+    def test_manual_and_scan_receiving_modes_cannot_be_mixed(self):
+        manual_po = self.client.post("/purchase-orders", json={
+            "po_id": "PO-MODE-MANUAL", "supplier": "Vendor",
+            "item_name": "Manual Item", "expected_batch": "MANUAL-1",
+            "expected_mrp": 75, "ordered_qty": 10,
+        })
+        manual_id = manual_po.json["line_id"]
+        receipt = self.client.post(f"/purchase-orders/{manual_id}/receive", json={
+            "quantity": 2, "note": "Manual counted delivery"
+        })
+        self.assertEqual(receipt.status_code, 200)
+
+        manual_record = {
+            "time": "12:21:00", "brand": "Manual Item", "barcode": "123",
+            "batch": "MANUAL-1", "mfr": "04/2026", "exp": "03/2028",
+            "mrp": "Rs.75.00", "mrp_num": 75.0, "action": "FRESH",
+            "status_code": "PASS", "task_status": "Neural ROI | Qual: PASS",
+            "data_valid": True,
+        }
+        aoi.insert_scan(manual_record)
+        self.assertEqual(manual_record["inventory_status"], "MANUAL RECEIVING MODE")
+        with sqlite3.connect(aoi.DB_PATH) as conn:
+            mode = conn.execute("SELECT receiving_mode FROM pending_orders WHERE rowid=?", (manual_id,)).fetchone()[0]
+            matched = conn.execute(
+                "SELECT matched_po_rowid FROM scans WHERE brand='Manual Item' ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+        self.assertEqual(mode, "MANUAL")
+        self.assertIsNone(matched)
+
+        scan_po = self.client.post("/purchase-orders", json={
+            "po_id": "PO-MODE-SCAN", "supplier": "Vendor",
+            "item_name": "Scanned Item", "expected_batch": "SCAN-1",
+            "expected_mrp": 85, "ordered_qty": 10,
+        })
+        scan_id = scan_po.json["line_id"]
+        scan_record = {
+            "time": "12:22:00", "brand": "Scanned Item", "barcode": "123",
+            "batch": "SCAN-1", "mfr": "04/2026", "exp": "03/2028",
+            "mrp": "Rs.85.00", "mrp_num": 85.0, "action": "FRESH",
+            "status_code": "PASS", "task_status": "Neural ROI | Qual: PASS",
+            "data_valid": True,
+        }
+        aoi.insert_scan(scan_record)
+        self.assertEqual(scan_record["inventory_status"], "MATCH CANDIDATE")
+        manual_attempt = self.client.post(f"/purchase-orders/{scan_id}/receive", json={
+            "quantity": 1, "note": "Attempted manual duplicate"
+        })
+        self.assertEqual(manual_attempt.status_code, 409)
+
+    def test_closing_po_invalidates_pending_scan_approval(self):
+        created = self.client.post("/purchase-orders", json={
+            "po_id": "PO-CLOSE-SCAN", "supplier": "Vendor",
+            "item_name": "Close Test", "expected_batch": "CLOSE-1",
+            "expected_mrp": 95, "ordered_qty": 10,
+        })
+        line_id = created.json["line_id"]
+        record = {
+            "time": "12:23:00", "brand": "Close Test", "barcode": "123",
+            "batch": "CLOSE-1", "mfr": "04/2026", "exp": "03/2028",
+            "mrp": "Rs.95.00", "mrp_num": 95.0, "action": "FRESH",
+            "status_code": "PASS", "task_status": "Neural ROI | Qual: PASS",
+            "data_valid": True,
+        }
+        scan_id = aoi.insert_scan(record)
+        closed = self.client.post(f"/purchase-orders/{line_id}/close", json={"note": "PO cancelled"})
+        self.assertEqual(closed.status_code, 200)
+        ok, message = aoi.review_scan(scan_id, "approve")
+        self.assertFalse(ok)
+        with sqlite3.connect(aoi.DB_PATH) as conn:
+            row = conn.execute(
+                "SELECT review_status, matched_po_rowid FROM scans WHERE id=?", (scan_id,)
+            ).fetchone()
+        self.assertEqual(row[0], "NEEDS REVIEW")
+        self.assertIsNone(row[1])
+        events = [e["event_type"] for e in aoi.get_review_events()]
+        self.assertIn("PO_CLOSED_REVIEW_INVALIDATED", events)
+
+    def test_purchase_order_csv_export_includes_supplier_and_receiving_data(self):
+        created = self.client.post("/purchase-orders", json={
+            "po_id": "PO-EXPORT-001", "supplier": "Export Vendor",
+            "item_name": "Export Item", "expected_batch": "EXPORT-1",
+            "expected_mrp": 45, "ordered_qty": 6, "supplier_phone": "9876500000",
+        })
+        self.assertEqual(created.status_code, 201)
+        response = self.client.get("/purchase-orders/export.csv")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "text/csv")
+        self.assertIn(b"Supplier_Phone", response.data)
+        self.assertIn(b"PO-EXPORT-001", response.data)
+
     def test_oversized_request_is_rejected(self):
         aoi.app.config["MAX_CONTENT_LENGTH"] = 64
         response = self.client.post(
