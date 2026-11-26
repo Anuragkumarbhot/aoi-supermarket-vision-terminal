@@ -74,7 +74,9 @@ The PDF is generated from the current scan history; the CSV includes timestamps,
 - The hard-coded placeholder bearer token and default placeholder sales endpoint have been removed from the application.
 - The Flask process binds to `127.0.0.1` by default and refuses non-localhost `AOI_HOST` values. For remote access, keep the app local and place it behind a separately configured reverse proxy with authentication, authorization, TLS, and network restrictions. The built-in Flask server is for development, not production.
 - Image upload requests are limited to 8 MiB and the scan route validates the JSON payload, image data URL, base64 data, and decoded image before processing.
-- These changes reduce accidental exposure; they do **not** add user login or per-user authorization. Do not treat the dashboard as safe for shared or public access.
+- Optional operator authentication is available through `AOI_AUTH_USERNAME` and `AOI_AUTH_PASSWORD`. Set both to enable HTTP Basic authentication for the dashboard, scan, edit, delete, reset, and export routes; the browser will prompt for credentials. If either variable is set without the other, the app refuses to start.
+- Authentication is not enabled when both variables are unset. In that mode, use the dashboard only on the local device. Basic authentication does not provide roles or multi-user audit identity, and it must not be exposed over plain HTTP on an untrusted network.
+- These controls are defense-in-depth, not a production security certification. Do not expose the dashboard publicly.
 - Validate date formats, MRP parsing, batch matching, and FEFO decisions against real product labels and store procedures.
 - This project is an inventory-assistance prototype, not a replacement for the store's authoritative ERP or receiving controls.
 
