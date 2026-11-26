@@ -56,11 +56,11 @@ python app.py
 
 5. Open `http://127.0.0.1:5000` in the device browser.
 
-The setup script installs Python, Tesseract, Pillow, and Flask. The application listens on port 5000.
+The setup script installs Python, Tesseract, Pillow, and Flask. By default, the application listens only on `127.0.0.1:5000` so it is accessible from the same device.
 
 ## Data and exports
 
-The application creates `inventory_audit.db` beside `app.py`. Scan records and pending purchase-order rows are stored in SQLite. The export endpoints generate:
+The application creates `inventory_audit.db` beside `app.py`. Scan records and pending purchase-order rows are stored in SQLite. The server accepts request bodies up to 8 MiB; oversized requests are rejected. The export endpoints generate:
 
 - `v3_Neural_Audit_Report.pdf`
 - `v3_Neural_ERP.csv`
@@ -70,8 +70,11 @@ The PDF is generated from the current scan history; the CSV includes timestamps,
 ## Important deployment and safety notes
 
 - Do not treat OCR output as verified stock data without human review and representative accuracy testing.
-- The source currently contains a placeholder sales-server URL and a hard-coded placeholder bearer credential in the sync routine. **Do not enable external synchronization in production until the endpoint and credential handling are replaced with secure environment-based configuration.**
-- The development server is started with `host="0.0.0.0"`. Do not expose it to an untrusted network without authentication, authorization, request-size limits, and transport security.
+- External sales synchronization is **disabled by default**. It starts only when both `AOI_SALES_SYNC_URL` and `AOI_SALES_SYNC_TOKEN` are configured. The URL must use HTTPS. Never commit real credentials to the repository; inject them through the runtime environment or a secrets manager.
+- The hard-coded placeholder bearer token and default placeholder sales endpoint have been removed from the application.
+- The Flask process binds to `127.0.0.1` by default and refuses non-localhost `AOI_HOST` values. For remote access, keep the app local and place it behind a separately configured reverse proxy with authentication, authorization, TLS, and network restrictions. The built-in Flask server is for development, not production.
+- Image upload requests are limited to 8 MiB and the scan route validates the JSON payload, image data URL, base64 data, and decoded image before processing.
+- These changes reduce accidental exposure; they do **not** add user login or per-user authorization. Do not treat the dashboard as safe for shared or public access.
 - Validate date formats, MRP parsing, batch matching, and FEFO decisions against real product labels and store procedures.
 - This project is an inventory-assistance prototype, not a replacement for the store's authoritative ERP or receiving controls.
 
