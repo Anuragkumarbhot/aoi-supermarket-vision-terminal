@@ -284,6 +284,8 @@ def multi_task_neural_pipeline(pil_img, active_product):
         validation_issues.append("DATE ORDER INVALID")
     if mrp_val is None or not (0 < mrp_val <= 1000000):
         validation_issues.append("MRP MISSING/INVALID")
+    if quality_res != "PASS":
+        validation_issues.append("IMAGE QUALITY " + quality_res)
     data_valid = not validation_issues
 
     now = datetime.now()
