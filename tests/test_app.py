@@ -58,6 +58,9 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
         self.assertIn("scans", tables)
         self.assertIn("pending_orders", tables)
         self.assertIn("scan_review_events", tables)
+        self.assertIn("goods_receipts", tables)
+        self.assertIn("supplier_invoices", tables)
+        self.assertIn("supplier_invoice_lines", tables)
 
     def test_scan_rejects_non_json_payload(self):
         response = self.client.post("/scan", data="not-json", content_type="text/plain")
@@ -662,6 +665,10 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
                 "SELECT receiving_mode FROM pending_orders WHERE rowid=?", (scan_id,)
             ).fetchone()[0]
         self.assertEqual(mode, "SCAN")
+        grns = self.client.get("/goods-receipts").json["goods_receipts"]
+        scan_grn = next(x for x in grns if x["source"] == "SCAN")
+        self.assertEqual(scan_grn["delivery_ref"], f"SCAN-{next(x['id'] for x in aoi.get_all_scans() if x['brand'] == 'Scanned Item')}")
+        self.assertEqual(scan_grn["quantity"], 1)
 
     def test_closing_po_invalidates_pending_scan_approval(self):
         created = self.client.post("/purchase-orders", json={
