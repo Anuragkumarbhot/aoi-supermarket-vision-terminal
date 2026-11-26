@@ -31,6 +31,7 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
         with sqlite3.connect(aoi.DB_PATH) as conn:
             conn.execute("DELETE FROM scans")
             conn.execute("DELETE FROM sqlite_sequence WHERE name='scans'")
+            conn.execute("DELETE FROM scan_review_events")
             conn.execute("UPDATE pending_orders SET received_qty = 12")
             conn.commit()
         self.client = aoi.app.test_client()
@@ -39,6 +40,7 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"NEURAL EDGE VISION TERMINAL", response.data)
+        self.assertIn(b"Operator Audit Trail", response.data)
 
     def test_database_initializes_required_tables(self):
         with sqlite3.connect(aoi.DB_PATH) as conn:
@@ -49,6 +51,7 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
             }
         self.assertIn("scans", tables)
         self.assertIn("pending_orders", tables)
+        self.assertIn("scan_review_events", tables)
 
     def test_scan_rejects_non_json_payload(self):
         response = self.client.post("/scan", data="not-json", content_type="text/plain")
@@ -231,6 +234,128 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
         self.assertIsNotNone(aoi.parse_label_date("15/04/2026"))
         self.assertIsNone(aoi.parse_label_date("19/2026"))
         self.assertIsNone(aoi.parse_label_date(""))
+
+    def test_operator_audit_records_scan_capture_and_approval(self):
+        record = {
+            "time": "12:10:00", "brand": "Test", "barcode": "123",
+            "batch": "GL-26105", "mfr": "04/2026", "exp": "03/2028",
+            "mrp": "Rs.100.00", "mrp_num": 100.0, "action": "FRESH",
+            "status_code": "PASS", "task_status": "Neural ROI | Qual: PASS",
+            "data_valid": True,
+        }
+        scan_id = aoi.insert_scan(record)
+        ok, message = aoi.review_scan(scan_id, "approve", "Physically verified")
+        self.assertTrue(ok, message)
+
+        events = aoi.get_review_events()
+        event_types = [event["event_type"] for event in events]
+        self.assertIn("SCAN_CAPTURED", event_types)
+        self.assertIn("SCAN_APPROVED", event_types)
+        approval = next(event for event in events if event["event_type"] == "SCAN_APPROVED")
+        self.assertEqual(approval["note"], "Physically verified")
+        self.assertEqual(approval["operator"], "local-operator")
+
+    def test_operator_correction_rechecks_po_and_updates_mrp_numeric_value(self):
+        record = {
+            "time": "12:11:00", "brand": "Test", "barcode": "123",
+            "batch": "GL-26105", "mfr": "04/2026", "exp": "03/2028",
+            "mrp": "Rs.125.00", "mrp_num": 125.0, "action": "FRESH",
+            "status_code": "PASS", "task_status": "Neural ROI | Qual: PASS",
+            "data_valid": True,
+        }
+        scan_id = aoi.insert_scan(record)
+        self.assertEqual(record["inventory_status"], "MRP MISMATCH")
+
+        response = self.client.post("/update", json={
+            "id": scan_id, "field": "mrp", "value": "Rs.100.00"
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["review_status"], "PENDING")
+        with sqlite3.connect(aoi.DB_PATH) as conn:
+            row = conn.execute(
+                "SELECT mrp, mrp_num, review_status, matched_po_rowid FROM scans WHERE id=?",
+                (scan_id,)
+            ).fetchone()
+        self.assertEqual(row[0], "Rs.100.00")
+        self.assertEqual(row[1], 100.0)
+        self.assertEqual(row[2], "PENDING")
+        self.assertIsNotNone(row[3])
+
+        correction = next(e for e in aoi.get_review_events() if e["event_type"] == "FIELD_CORRECTED")
+        self.assertIn('"field": "mrp"', correction["details_json"])
+
+    def test_invalid_mrp_correction_is_rejected_without_mutation(self):
+        record = {
+            "time": "12:12:00", "brand": "Test", "barcode": "123",
+            "batch": "GL-26105", "mfr": "04/2026", "exp": "03/2028",
+            "mrp": "Rs.100.00", "mrp_num": 100.0, "action": "FRESH",
+            "status_code": "PASS", "task_status": "Neural ROI | Qual: PASS",
+            "data_valid": True,
+        }
+        scan_id = aoi.insert_scan(record)
+        response = self.client.post("/update", json={
+            "id": scan_id, "field": "mrp", "value": "not-a-price"
+        })
+        self.assertEqual(response.status_code, 400)
+        with sqlite3.connect(aoi.DB_PATH) as conn:
+            mrp = conn.execute("SELECT mrp FROM scans WHERE id=?", (scan_id,)).fetchone()[0]
+        self.assertEqual(mrp, "Rs.100.00")
+
+    def test_approved_scan_is_locked_against_field_correction(self):
+        record = {
+            "time": "12:13:00", "brand": "Test", "barcode": "123",
+            "batch": "GL-26105", "mfr": "04/2026", "exp": "03/2028",
+            "mrp": "Rs.100.00", "mrp_num": 100.0, "action": "FRESH",
+            "status_code": "PASS", "task_status": "Neural ROI | Qual: PASS",
+            "data_valid": True,
+        }
+        scan_id = aoi.insert_scan(record)
+        ok, message = aoi.review_scan(scan_id, "approve", "Verified")
+        self.assertTrue(ok, message)
+        response = self.client.post("/update", json={
+            "id": scan_id, "field": "batch", "value": "CHANGED"
+        })
+        self.assertEqual(response.status_code, 409)
+
+    def test_delete_keeps_audit_trail_tombstone(self):
+        record = {
+            "time": "12:14:00", "brand": "Test", "barcode": "123",
+            "batch": "", "mfr": "", "exp": "", "mrp": "", "mrp_num": None,
+            "action": "REVIEW REQUIRED", "status_code": "FAIL",
+            "task_status": "TEST", "data_valid": False,
+        }
+        scan_id = aoi.insert_scan(record)
+        response = self.client.post("/delete", json={"id": scan_id})
+        self.assertEqual(response.status_code, 200)
+        event_types = [e["event_type"] for e in aoi.get_review_events()]
+        self.assertIn("SCAN_CAPTURED", event_types)
+        self.assertIn("SCAN_DELETED", event_types)
+        with sqlite3.connect(aoi.DB_PATH) as conn:
+            self.assertIsNone(conn.execute("SELECT id FROM scans WHERE id=?", (scan_id,)).fetchone())
+
+    def test_audit_endpoint_returns_json_events(self):
+        record = {
+            "time": "12:15:00", "brand": "Test", "barcode": "123",
+            "batch": "", "mfr": "", "exp": "", "mrp": "", "mrp_num": None,
+            "action": "REVIEW REQUIRED", "status_code": "FAIL",
+            "task_status": "TEST", "data_valid": False,
+        }
+        aoi.insert_scan(record)
+        response = self.client.get("/audit")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("SCAN_CAPTURED", [e["event_type"] for e in response.json["events"]])
+
+    def test_pdf_export_handles_blank_ocr_mrp(self):
+        record = {
+            "time": "12:16:00", "brand": "Test", "barcode": "NONE",
+            "batch": "", "mfr": "", "exp": "", "mrp": "", "mrp_num": None,
+            "action": "REVIEW REQUIRED", "status_code": "FAIL",
+            "task_status": "TEST", "data_valid": False,
+        }
+        aoi.insert_scan(record)
+        response = self.client.get("/export_pdf")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "application/pdf")
 
     def test_oversized_request_is_rejected(self):
         aoi.app.config["MAX_CONTENT_LENGTH"] = 64
