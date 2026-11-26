@@ -930,7 +930,7 @@ def _po_quantity(value, key, minimum=1, maximum=1000000):
         raise ValueError(f"{key} must be a whole number.")
     if isinstance(value, int):
         number = value
-    elif isinstance(value, str) and re.fullmatch(r"\\d+", value.strip()):
+    elif isinstance(value, str) and re.fullmatch(r"\d+", value.strip()):
         number = int(value.strip())
     else:
         raise ValueError(f"{key} must be a whole number.")
