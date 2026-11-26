@@ -1565,6 +1565,108 @@ def export_purchase_orders_csv():
     return response
 
 
+@app.route("/goods-receipts", methods=["GET"])
+def goods_receipts():
+    return jsonify({"goods_receipts": get_goods_receipts(500)})
+
+
+@app.route("/supplier-invoices", methods=["GET"])
+def supplier_invoices():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        headers = conn.execute(
+            "SELECT * FROM supplier_invoices ORDER BY id DESC LIMIT 200"
+        ).fetchall()
+        result = []
+        for header in headers:
+            item = dict(header)
+            item["lines"] = [
+                dict(row) for row in conn.execute(
+                    "SELECT * FROM supplier_invoice_lines WHERE invoice_id=? ORDER BY id",
+                    (header["id"],)
+                ).fetchall()
+            ]
+            result.append(item)
+    return jsonify({"supplier_invoices": result})
+
+
+@app.route("/supplier-invoices", methods=["POST"])
+def create_supplier_invoice():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "A JSON object is required."}), 400
+    try:
+        invoice_number = _po_text(data, "invoice_number", True, 60)
+        supplier = _po_text(data, "supplier", True, 120)
+        invoice_date = _po_date(data, "invoice_date")
+        if not invoice_date:
+            raise ValueError("invoice_date is required.")
+        delivery_ref = _po_text(data, "delivery_ref", True, 100)
+        invoice_total = _invoice_amount(data.get("invoice_total"), "invoice_total")
+        lines = data.get("lines")
+        if not isinstance(lines, list) or not lines or len(lines) > 200:
+            raise ValueError("lines must contain between 1 and 200 invoice lines.")
+        normalized = []
+        calculated = 0.0
+        for index, line in enumerate(lines, start=1):
+            if not isinstance(line, dict):
+                raise ValueError(f"Invoice line {index} must be an object.")
+            po_line_id = _po_quantity(line.get("po_line_id"), "po_line_id")
+            quantity = _po_quantity(line.get("quantity"), "quantity")
+            unit_cost = _invoice_amount(line.get("unit_cost"), "unit_cost")
+            line_total = round(quantity * unit_cost, 2)
+            normalized.append((po_line_id, quantity, unit_cost, line_total))
+            calculated += line_total
+        if abs(round(calculated, 2) - invoice_total) >= 0.01:
+            raise ValueError(f"Invoice total does not equal line totals ({round(calculated, 2):.2f}).")
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            po_rows = {}
+            for po_line_id, quantity, unit_cost, line_total in normalized:
+                po = conn.execute(
+                    "SELECT po_id, supplier, item_name FROM pending_orders WHERE rowid=?",
+                    (po_line_id,)
+                ).fetchone()
+                if po is None:
+                    raise ValueError(f"Purchase-order line {po_line_id} does not exist.")
+                po_rows[po_line_id] = po
+            now = datetime.now().isoformat(timespec="seconds")
+            cursor = conn.execute(
+                """INSERT INTO supplier_invoices
+                   (invoice_number, supplier, invoice_date, delivery_ref, invoice_total, status, created_at, operator)
+                   VALUES (?, ?, ?, ?, ?, 'UNRECONCILED', ?, ?)""",
+                (invoice_number, supplier, invoice_date, delivery_ref, invoice_total, now, current_operator())
+            )
+            invoice_id = cursor.lastrowid
+            for po_line_id, quantity, unit_cost, line_total in normalized:
+                po = po_rows[po_line_id]
+                conn.execute(
+                    """INSERT INTO supplier_invoice_lines
+                       (invoice_id, po_rowid, po_id, item_name, invoiced_qty, unit_cost, line_total)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (invoice_id, po_line_id, po["po_id"], po["item_name"], quantity, unit_cost, line_total)
+                )
+            report = reconcile_supplier_invoice(conn, invoice_id)
+            conn.commit()
+        return jsonify({"status": "success", "invoice_id": invoice_id, "reconciliation": report}), 201
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "This supplier invoice number already exists for this supplier."}), 409
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/supplier-invoices/<int:invoice_id>/reconcile", methods=["POST"])
+def rerun_supplier_invoice_reconciliation(invoice_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            report = reconcile_supplier_invoice(conn, invoice_id)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 404
+        conn.commit()
+    return jsonify({"status": "success", "reconciliation": report})
+
+
 @app.route("/audit", methods=["GET"])
 def audit():
     return jsonify({"events": get_review_events(500)})
