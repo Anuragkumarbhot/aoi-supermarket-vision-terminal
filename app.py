@@ -157,8 +157,6 @@ def review_scan(scan_id, decision, note=""):
             return True, "Scan rejected."
         if scan["review_status"] != "PENDING":
             return False, "This scan is not eligible for approval; resolve OCR and PO issues first."
-        if decision == "approve":
-            pass
         required = (scan["batch"], scan["mfr"], scan["exp"], scan["mrp_num"])
         mfr_date = parse_label_date(scan["mfr"])
         expiry_date = parse_label_date(scan["exp"])
