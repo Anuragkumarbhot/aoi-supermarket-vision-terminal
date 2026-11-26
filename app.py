@@ -136,7 +136,15 @@ def insert_scan(rec):
         inventory_status = "REVIEW REQUIRED"
         matched_po_rowid = None
         review_status = "NEEDS REVIEW"
-        if rec.get("data_valid"):
+        expiry_dt = parse_label_date(rec.get("exp", ""))
+        today = datetime.now()
+        already_expired = bool(
+            expiry_dt and (expiry_dt.year < today.year or
+                           (expiry_dt.year == today.year and expiry_dt.month < today.month))
+        )
+        if already_expired:
+            inventory_status = "EXPIRED - DO NOT RECEIVE"
+        if rec.get("data_valid") and not already_expired:
             matches = cur.execute(
                 """SELECT rowid, expected_mrp, ordered_qty, received_qty
                    FROM pending_orders WHERE UPPER(TRIM(expected_batch)) = UPPER(TRIM(?))""",
@@ -158,7 +166,7 @@ def insert_scan(rec):
                     inventory_status = "ORDER QUANTITY REACHED"
         rec["inventory_status"] = inventory_status
         if review_status != "PENDING":
-            rec["status_code"] = "FAIL" if not rec.get("data_valid") or inventory_status == "MRP MISMATCH" else "WARN"
+            rec["status_code"] = "FAIL" if not rec.get("data_valid") or "EXPIRED" in inventory_status or inventory_status == "MRP MISMATCH" else "WARN"
             rec["action"] = "REVIEW REQUIRED" if not rec.get("data_valid") else inventory_status + " - REVIEW"
         rec["task_status"] += " | Inventory: " + inventory_status + " | Operator review: " + review_status
         cur.execute("""
@@ -209,6 +217,9 @@ def review_scan(scan_id, decision, note=""):
         expiry_date = parse_label_date(scan["exp"])
         if not all(required) or not mfr_date or not expiry_date or mfr_date >= expiry_date:
             return False, "Required OCR dates or MRP are invalid; resolve the scan before approval."
+        today = datetime.now()
+        if expiry_date.year < today.year or (expiry_date.year == today.year and expiry_date.month < today.month):
+            return False, "Expired products cannot be received into stock."
         po_rowid = scan["matched_po_rowid"]
         if po_rowid is None:
             return False, "No matching purchase order is linked to this scan."
@@ -782,9 +793,14 @@ def update():
             fresh["batch"] and mfr_date and expiry_date and mfr_date < expiry_date
             and fresh["mrp_num"] is not None and 0 < float(fresh["mrp_num"]) <= 1000000
         )
+        today = datetime.now()
+        expired = bool(
+            expiry_date and (expiry_date.year < today.year or
+                             (expiry_date.year == today.year and expiry_date.month < today.month))
+        )
         quality_flagged = "QUAL: BLURRY" in (fresh["task_status"] or "").upper() or "QUAL: UNKNOWN" in (fresh["task_status"] or "").upper()
         candidate = None
-        if fields_valid and not quality_flagged:
+        if fields_valid and not quality_flagged and not expired:
             candidate = conn.execute(
                 """SELECT rowid FROM pending_orders
                    WHERE UPPER(TRIM(expected_batch))=UPPER(TRIM(?))
@@ -794,9 +810,12 @@ def update():
                 (fresh["batch"], fresh["mrp_num"])
             ).fetchone()
         new_review_status = "PENDING" if candidate else "NEEDS REVIEW"
+        updated_action = "CORRECTED - READY FOR REVIEW" if candidate else (
+            "EXPIRED - DO NOT RECEIVE" if expired else "REVIEW REQUIRED"
+        )
         conn.execute(
-            "UPDATE scans SET matched_po_rowid=?, review_status=? WHERE id=?",
-            (candidate["rowid"] if candidate else None, new_review_status, data["id"])
+            "UPDATE scans SET matched_po_rowid=?, review_status=?, action=? WHERE id=?",
+            (candidate["rowid"] if candidate else None, new_review_status, updated_action, data["id"])
         )
         after = {key: fresh[key] for key in ("brand", "batch", "mfr", "exp", "mrp", "mrp_num")}
         after["review_status"] = new_review_status
