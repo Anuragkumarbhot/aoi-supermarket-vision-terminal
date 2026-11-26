@@ -29,6 +29,7 @@ The browser UI also includes optional voice commands where the browser supports 
 | `/purchase-orders/{line_id}/receive` | POST | Record a counted partial or full delivery |
 | `/purchase-orders/{line_id}/close` | POST | Close an open purchase-order line |
 | `/purchase-orders/events` | GET | Retrieve recent PO audit events |
+| `/purchase-orders/export.csv` | GET | Export PO lines, supplier details, balances and receiving mode as CSV |
 | `/update` | POST | Correct OCR fields on unreviewed scans; revalidates MRP and PO matching |
 | `/review` | POST | Approve or reject a scan |
 | `/audit` | GET | Retrieve the latest append-only operator audit events |
@@ -42,6 +43,9 @@ The browser UI also includes optional voice commands where the browser supports 
 - Add purchase-order lines with PO number, supplier, item, expected batch, expected MRP, ordered quantity, supplier contact details, order date, expected delivery date, and notes.
 - Import up to 500 lines using CSV. The required columns are `po_id,supplier,item_name,expected_batch,expected_mrp,ordered_qty`; supplier contact, phone, email, dates, and notes are optional. Imports are all-or-nothing and reject duplicate PO/item/batch lines.
 - Record counted partial deliveries with a positive quantity and a required delivery note/reference. The API prevents receipts above the remaining ordered quantity and marks a line COMPLETE when fully received.
+- Each PO line is assigned one receiving mode: `MANUAL` for counted quantity receipts or `SCAN` for camera-scan approvals. The modes cannot be mixed on the same PO line, preventing a delivery from being counted once manually and again through scans. A PO line is assigned to scan receiving when its first eligible scan is linked.
+- Closing a PO line invalidates its pending scan approvals, moves those scans back to NEEDS REVIEW, and records the invalidation in the scan audit log.
+- Export purchase-order data from the dashboard or `GET /purchase-orders/export.csv`. The export contains supplier contacts, item/batch/MRP, ordered/received/remaining quantities, status, receiving mode, dates and notes.
 - Supplier and delivery metadata can be edited. Ordered quantity cannot be reduced below already received quantity. Item, batch and MRP are locked after scans are linked or stock is received.
 - Open PO lines can be closed; closed and complete lines are not eligible for new stock matching or additional receipt entries.
 - PO creation, edits, partial/full receipt and closure are stored in a separate purchase-order event log. Use `GET /purchase-orders/events` to retrieve recent activity.
