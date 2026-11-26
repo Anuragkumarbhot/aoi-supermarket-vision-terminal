@@ -85,9 +85,17 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
 
         dashboard = self.client.get("/")
         clear = self.client.post("/clear")
+        purchase_orders = self.client.get("/purchase-orders")
+        create_po = self.client.post("/purchase-orders", json={
+            "po_id": "PO-AUTH-001", "supplier": "Vendor",
+            "item_name": "Auth Test", "expected_batch": "AUTH-1",
+            "expected_mrp": 10, "ordered_qty": 2,
+        })
 
         self.assertEqual(dashboard.status_code, 401)
         self.assertEqual(clear.status_code, 401)
+        self.assertEqual(purchase_orders.status_code, 401)
+        self.assertEqual(create_po.status_code, 401)
         self.assertIn("WWW-Authenticate", dashboard.headers)
 
     def test_valid_authentication_allows_dashboard_and_export(self):
