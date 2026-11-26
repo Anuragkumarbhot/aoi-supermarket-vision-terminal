@@ -617,10 +617,24 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
         }
         aoi.insert_scan(scan_record)
         self.assertEqual(scan_record["inventory_status"], "MATCH CANDIDATE")
+        pending_manual_attempt = self.client.post(f"/purchase-orders/{scan_id}/receive", json={
+            "quantity": 1, "note": "Attempted manual receipt while scan pending"
+        })
+        self.assertEqual(pending_manual_attempt.status_code, 409)
+        ok, message = aoi.review_scan(
+            next(x["id"] for x in aoi.get_all_scans() if x["brand"] == "Scanned Item"),
+            "approve", "Physical unit verified"
+        )
+        self.assertTrue(ok, message)
         manual_attempt = self.client.post(f"/purchase-orders/{scan_id}/receive", json={
-            "quantity": 1, "note": "Attempted manual duplicate"
+            "quantity": 1, "note": "Attempted manual duplicate after scan approval"
         })
         self.assertEqual(manual_attempt.status_code, 409)
+        with sqlite3.connect(aoi.DB_PATH) as conn:
+            mode = conn.execute(
+                "SELECT receiving_mode FROM pending_orders WHERE rowid=?", (scan_id,)
+            ).fetchone()[0]
+        self.assertEqual(mode, "SCAN")
 
     def test_closing_po_invalidates_pending_scan_approval(self):
         created = self.client.post("/purchase-orders", json={
