@@ -280,9 +280,32 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
         self.assertEqual(row[1], 100.0)
         self.assertEqual(row[2], "PENDING")
         self.assertIsNotNone(row[3])
+        with sqlite3.connect(aoi.DB_PATH) as conn:
+            action = conn.execute("SELECT action FROM scans WHERE id=?", (scan_id,)).fetchone()[0]
+        self.assertEqual(action, "CORRECTED - READY FOR REVIEW")
 
         correction = next(e for e in aoi.get_review_events() if e["event_type"] == "FIELD_CORRECTED")
         self.assertIn('"field": "mrp"', correction["details_json"])
+
+    def test_expired_stock_never_becomes_a_receiving_candidate(self):
+        before = aoi.get_pending_orders()[0]["received_qty"]
+        record = {
+            "time": "12:17:00", "brand": "Test expired lot", "barcode": "123",
+            "batch": "GL-26105", "mfr": "01/2025", "exp": "01/2026",
+            "mrp": "Rs.100.00", "mrp_num": 100.0, "action": "EXPIRED - RETURN",
+            "status_code": "FAIL", "task_status": "Neural ROI | Qual: PASS",
+            "data_valid": True,
+        }
+        scan_id = aoi.insert_scan(record)
+        self.assertEqual(record["inventory_status"], "EXPIRED - DO NOT RECEIVE")
+        with sqlite3.connect(aoi.DB_PATH) as conn:
+            status = conn.execute(
+                "SELECT review_status FROM scans WHERE id=?", (scan_id,)
+            ).fetchone()[0]
+        self.assertEqual(status, "NEEDS REVIEW")
+        ok, _ = aoi.review_scan(scan_id, "approve")
+        self.assertFalse(ok)
+        self.assertEqual(aoi.get_pending_orders()[0]["received_qty"], before)
 
     def test_invalid_mrp_correction_is_rejected_without_mutation(self):
         record = {
