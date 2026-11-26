@@ -82,6 +82,17 @@ def init_db():
         ):
             if column not in scan_columns:
                 conn.execute(f"ALTER TABLE scans ADD COLUMN {column} {definition}")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS scan_review_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                operator TEXT NOT NULL,
+                event_at TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}'
+            )
+        """)
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM pending_orders")
         if cur.fetchone()[0] == 0:
@@ -90,6 +101,33 @@ def init_db():
                 VALUES ('PO-2026-884', 'Gericon Pharma India', 'Cough Syrup DX', 'GL-26105', 100.00, 50, 12)
             """)
             conn.commit()
+
+def current_operator():
+    """Return the configured operator label without exposing credentials."""
+    return AOI_AUTH_USERNAME if AUTH_ENABLED else os.environ.get("AOI_OPERATOR_NAME", "local-operator")
+
+
+def record_scan_event(conn, scan_id, event_type, note="", details=None):
+    """Append an immutable audit event using the caller's active transaction."""
+    conn.execute(
+        """INSERT INTO scan_review_events
+           (scan_id, event_type, operator, event_at, note, details_json)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (scan_id, event_type, current_operator(),
+         datetime.now().isoformat(timespec="seconds"), note.strip() if isinstance(note, str) else "",
+         json.dumps(details or {}, sort_keys=True, ensure_ascii=False))
+    )
+
+
+def get_review_events(limit=100):
+    limit = max(1, min(int(limit), 500))
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM scan_review_events ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
 
 def insert_scan(rec):
     """Save a scan for human review; never change received stock automatically."""
@@ -132,6 +170,11 @@ def insert_scan(rec):
               rec["mrp"], rec["mrp_num"], rec["action"], rec["task_status"],
               review_status, matched_po_rowid))
         scan_id = cur.lastrowid
+        record_scan_event(
+            conn, scan_id, "SCAN_CAPTURED", "",
+            {"review_status": review_status, "inventory_status": inventory_status,
+             "batch": rec.get("batch", ""), "mrp_num": rec.get("mrp_num")}
+        )
         conn.commit()
         return scan_id
 
@@ -152,6 +195,10 @@ def review_scan(scan_id, decision, note=""):
             conn.execute(
                 "UPDATE scans SET review_status='REJECTED', reviewed_at=?, review_note=? WHERE id=? AND review_status IN ('PENDING', 'NEEDS REVIEW')",
                 (datetime.now().isoformat(timespec="seconds"), note.strip(), scan_id)
+            )
+            record_scan_event(
+                conn, scan_id, "SCAN_REJECTED", note,
+                {"previous_status": scan["review_status"], "new_status": "REJECTED"}
             )
             conn.commit()
             return True, "Scan rejected."
@@ -177,6 +224,11 @@ def review_scan(scan_id, decision, note=""):
         conn.execute(
             "UPDATE scans SET review_status='APPROVED', reviewed_at=?, review_note=? WHERE id=? AND review_status='PENDING'",
             (datetime.now().isoformat(timespec="seconds"), note.strip(), scan_id)
+        )
+        record_scan_event(
+            conn, scan_id, "SCAN_APPROVED", note,
+            {"previous_status": "PENDING", "new_status": "APPROVED",
+             "purchase_order_rowid": po_rowid, "received_increment": 1}
         )
         conn.commit()
         return True, "Scan approved and one unit received.";
@@ -482,19 +534,38 @@ HTML_UI = """
   <div class="table-wrap">
     <div style="background:#090D16; padding:5px; font-size:10px; font-weight:bold; color:#34D399; border-bottom:1px solid var(--border);">📝 Neural Inward Scans Log</div>
     <table id="logTable">
-      <thead><tr><th>#</th><th>Product</th><th>Batch</th><th>EXP</th><th>MRP</th><th>Pipeline / Review</th><th>Review</th><th>Del</th></tr></thead>
+      <thead><tr><th>#</th><th>Product</th><th>Batch</th><th>MFR</th><th>EXP</th><th>MRP</th><th>Pipeline / Review</th><th>Review</th><th>Del</th></tr></thead>
       <tbody>
         {% for s in scans %}
         <tr id="row-{{ s.id }}">
           <td>{{ s.id }}</td>
           <td><span class="editable" onclick="editCell({{ s.id }}, 'brand', '{{ s.brand }}')">{{ s.brand }}</span></td>
           <td><span class="editable" onclick="editCell({{ s.id }}, 'batch', '{{ s.batch }}')">{{ s.batch }}</span></td>
+          <td><span class="editable" onclick="editCell({{ s.id }}, 'mfr', '{{ s.mfr }}')">{{ s.mfr }}</span></td>
           <td><span class="editable" onclick="editCell({{ s.id }}, 'exp', '{{ s.exp }}')">{{ s.exp }}</span></td>
           <td><span class="editable" onclick="editCell({{ s.id }}, 'mrp', '{{ s.mrp }}')">{{ s.mrp }}</span></td>
           <td style="font-size:9px; color:#38BDF8;">{{ s.task_status }}<br><b>{{ s.review_status }}</b>{% if s.review_note %}<br>{{ s.review_note }}{% endif %}</td>
           <td>{% if s.review_status == 'PENDING' %}<button class="review-btn" onclick="reviewRow({{ s.id }}, 'approve')">Approve</button><button class="reject-btn" onclick="reviewRow({{ s.id }}, 'reject')">Reject</button>{% elif s.review_status == 'NEEDS REVIEW' %}<button class="reject-btn" onclick="reviewRow({{ s.id }}, 'reject')">Reject</button>{% else %}{{ s.review_status or '—' }}{% endif %}</td>
           <td><button class="del-btn" onclick="deleteRow({{ s.id }})">🗑️</button></td>
         </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- APPEND-ONLY REVIEW AUDIT TRAIL -->
+  <div class="table-wrap">
+    <div style="background:#090D16; padding:5px; font-size:10px; font-weight:bold; color:#C4B5FD; border-bottom:1px solid var(--border);">🧾 Operator Audit Trail (latest 100 events)</div>
+    <table id="reviewAuditTable">
+      <thead><tr><th>Time</th><th>Scan</th><th>Event</th><th>Operator</th><th>Note</th></tr></thead>
+      <tbody>
+        {% for e in review_events %}
+        <tr>
+          <td>{{ e.event_at }}</td><td>#{{ e.scan_id }}</td><td>{{ e.event_type }}</td>
+          <td>{{ e.operator }}</td><td>{{ e.note }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5">No review events recorded yet.</td></tr>
         {% endfor %}
       </tbody>
     </table>
@@ -592,10 +663,16 @@ function toggleAutoLoop() {
 window.addEventListener('keydown', e => { if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); captureROI(); } });
 
 function editCell(id, field, currentVal) {
-  var newVal = prompt("Edit " + field.toUpperCase() + ":", currentVal);
-  if (!newVal) return;
+  var newVal = prompt("Correct " + field.toUpperCase() + ":", currentVal || "");
+  if (newVal === null) return;
   fetch('/update', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: id, field: field, value: newVal.trim() }) })
-  .then(() => window.location.reload());
+  .then(async r => {
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "Correction failed");
+    alert(d.message);
+    window.location.reload();
+  })
+  .catch(e => alert(e.message));
 }
 
 function reviewRow(id, decision) {
@@ -623,7 +700,10 @@ function clearDB() {
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_UI, scans=get_all_scans(), pending_pos=get_pending_orders())
+    return render_template_string(
+        HTML_UI, scans=get_all_scans(), pending_pos=get_pending_orders(),
+        review_events=get_review_events(100)
+    )
 
 @app.route("/scan", methods=["POST"])
 def scan():
@@ -656,13 +736,82 @@ def scan():
 
 @app.route("/update", methods=["POST"])
 def update():
-    data = request.get_json()
-    allowed = ["brand", "batch", "mfr", "exp", "mrp", "action"]
-    if data["field"] in allowed:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(f"UPDATE scans SET {data['field']} = ? WHERE id = ?", (data["value"], data["id"]))
-            conn.commit()
-    return jsonify({"status": "success"})
+    data = request.get_json(silent=True)
+    allowed = {"brand": 120, "batch": 40, "mfr": 20, "exp": 20, "mrp": 30}
+    if not isinstance(data, dict) or isinstance(data.get("id"), bool) or not isinstance(data.get("id"), int):
+        return jsonify({"error": "A numeric scan id is required."}), 400
+    field = data.get("field")
+    value = data.get("value")
+    if field not in allowed or not isinstance(value, str):
+        return jsonify({"error": "A supported field and text value are required."}), 400
+    value = value.strip()
+    if len(value) > allowed[field]:
+        return jsonify({"error": f"{field} exceeds the allowed length."}), 400
+
+    mrp_num = None
+    if field == "mrp" and value:
+        normalized = re.sub(r"^(?:RS\\.?|₹)\\s*", "", value, flags=re.IGNORECASE).strip()
+        if not re.fullmatch(r"\\d+(?:\\.\\d{1,2})?", normalized):
+            return jsonify({"error": "MRP must be a positive amount, for example 100.00."}), 400
+        mrp_num = float(normalized)
+        if not (0 < mrp_num <= 1000000):
+            return jsonify({"error": "MRP must be between 0 and 1,000,000."}), 400
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        scan = conn.execute("SELECT * FROM scans WHERE id=?", (data["id"],)).fetchone()
+        if scan is None:
+            return jsonify({"error": "Scan not found."}), 404
+        if scan["review_status"] not in {"PENDING", "NEEDS REVIEW"}:
+            return jsonify({"error": "Reviewed scans are locked against edits."}), 409
+
+        before = {key: scan[key] for key in ("brand", "batch", "mfr", "exp", "mrp", "mrp_num", "review_status")}
+        updates = {field: value}
+        if field == "mrp":
+            updates["mrp_num"] = mrp_num
+        assignments = ", ".join(f"{key}=?" for key in updates)
+        conn.execute(
+            f"UPDATE scans SET {assignments} WHERE id=?",
+            (*updates.values(), data["id"])
+        )
+
+        fresh = conn.execute("SELECT * FROM scans WHERE id=?", (data["id"],)).fetchone()
+        mfr_date = parse_label_date(fresh["mfr"])
+        expiry_date = parse_label_date(fresh["exp"])
+        fields_valid = bool(
+            fresh["batch"] and mfr_date and expiry_date and mfr_date < expiry_date
+            and fresh["mrp_num"] is not None and 0 < float(fresh["mrp_num"]) <= 1000000
+        )
+        quality_flagged = "QUAL: BLURRY" in (fresh["task_status"] or "").upper() or "QUAL: UNKNOWN" in (fresh["task_status"] or "").upper()
+        candidate = None
+        if fields_valid and not quality_flagged:
+            candidate = conn.execute(
+                """SELECT rowid FROM pending_orders
+                   WHERE UPPER(TRIM(expected_batch))=UPPER(TRIM(?))
+                     AND expected_mrp IS NOT NULL AND ABS(expected_mrp-?) < 0.005
+                     AND received_qty < ordered_qty
+                   ORDER BY rowid LIMIT 1""",
+                (fresh["batch"], fresh["mrp_num"])
+            ).fetchone()
+        new_review_status = "PENDING" if candidate else "NEEDS REVIEW"
+        conn.execute(
+            "UPDATE scans SET matched_po_rowid=?, review_status=? WHERE id=?",
+            (candidate["rowid"] if candidate else None, new_review_status, data["id"])
+        )
+        after = {key: fresh[key] for key in ("brand", "batch", "mfr", "exp", "mrp", "mrp_num")}
+        after["review_status"] = new_review_status
+        record_scan_event(
+            conn, data["id"], "FIELD_CORRECTED", "",
+            {"field": field, "before": before, "after": after}
+        )
+        conn.commit()
+    status_message = "Correction saved; scan is ready for operator review." if candidate else "Correction saved; scan still requires review."
+    return jsonify({"status": "success", "message": status_message, "review_status": new_review_status})
+
+@app.route("/audit", methods=["GET"])
+def audit():
+    return jsonify({"events": get_review_events(500)})
+
 
 @app.route("/review", methods=["POST"])
 def review():
