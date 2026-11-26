@@ -1395,7 +1395,6 @@ def create_purchase_order():
         values = _normalize_po_line(data)
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("BEGIN IMMEDIATE")
-            line_id = _insert_po_line(conn, values)        with sqlite3.connect(DB_PATH) as conn:
             line_id = _insert_po_line(conn, values)
             conn.commit()
         return jsonify({"status": "success", "line_id": line_id, "message": "Purchase-order line created."}), 201
@@ -1434,7 +1433,6 @@ def import_purchase_orders():
             normalized.append(values)
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("BEGIN IMMEDIATE")
-            line_ids = []        with sqlite3.connect(DB_PATH) as conn:
             line_ids = []
             for index, values in enumerate(normalized, start=2):
                 try:
