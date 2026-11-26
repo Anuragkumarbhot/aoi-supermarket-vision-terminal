@@ -275,9 +275,11 @@ def review_scan(scan_id, decision, note=""):
                WHERE rowid=? AND received_qty >= ordered_qty AND status='OPEN' AND receiving_mode='SCAN'""",
             (datetime.now().isoformat(timespec="seconds"), po_rowid)
         )
+        po_id_row = conn.execute(
+            "SELECT po_id FROM pending_orders WHERE rowid=?", (po_rowid,)
+        ).fetchone()
         record_po_event(
-            conn, po_rowid, scan["matched_po_rowid"] and scan["batch"] and
-            conn.execute("SELECT po_id FROM pending_orders WHERE rowid=?", (po_rowid,)).fetchone()[0] or "",
+            conn, po_rowid, po_id_row[0] if po_id_row else "",
             "SCAN_RECEIPT_APPROVED", note,
             {"scan_id": scan_id, "quantity": 1}
         )
@@ -570,7 +572,8 @@ HTML_UI = """
     <button class="btn-torch" id="torchBtn" onclick="toggleTorch()">🔦 Torch</button>
     <button class="btn-auto" id="autoBtn" onclick="toggleAutoLoop()">🔁 Auto</button>
     <button class="btn-pdf" onclick="window.location='/export_pdf'">📄 PDF</button>
-    <button style="background:#8B5CF6;" onclick="window.location='/export_csv'">📊 CSV</button>
+    <button style="background:#8B5CF6;" onclick="window.location='/export_csv'">📊 Scan CSV</button>
+    <button style="background:#6D28D9;" onclick="window.location='/purchase-orders/export.csv'">📦 PO CSV</button>
     <button class="btn-clear" onclick="clearDB()">🔄 Reset</button>
   </div>
 
@@ -956,7 +959,10 @@ def _po_amount(value, key="expected_mrp"):
         raise ValueError(f"{key} must be a positive amount.")
     if not (0 < amount <= 1000000):
         raise ValueError(f"{key} must be greater than 0 and at most 1,000,000.")
-    return round(amount, 2)
+    amount = round(amount, 2)
+    if amount <= 0:
+        raise ValueError(f"{key} must be at least 0.01.")
+    return amount
 
 
 def _po_date(data, key):
@@ -987,6 +993,8 @@ def _normalize_po_line(data):
         "expected_delivery": _po_date(data, "expected_delivery"),
         "notes": _po_text(data, "notes", False, 500),
     }
+    if values["supplier_email"] and not re.fullmatch(r"[^@\\s]+@[^@\\s]+\\.[^@\\s]+", values["supplier_email"]):
+        raise ValueError("supplier_email must be a valid email address.")
     if values["order_date"] and values["expected_delivery"] and values["expected_delivery"] < values["order_date"]:
         raise ValueError("expected_delivery cannot be earlier than order_date.")
     return values
@@ -1337,10 +1345,24 @@ def close_purchase_order(line_id):
         if row["status"] != "OPEN":
             return jsonify({"error": "Only OPEN purchase-order lines can be closed."}), 409
         now = datetime.now().isoformat(timespec="seconds")
+        linked_pending = conn.execute(
+            "SELECT id FROM scans WHERE matched_po_rowid=? AND review_status='PENDING'", (line_id,)
+        ).fetchall()
+        for scan_row in linked_pending:
+            scan_id = scan_row[0]
+            conn.execute(
+                """UPDATE scans SET review_status='NEEDS REVIEW', matched_po_rowid=NULL,
+                   action='PO CLOSED - REVIEW REQUIRED' WHERE id=?""", (scan_id,)
+            )
+            record_scan_event(
+                conn, scan_id, "PO_CLOSED_REVIEW_INVALIDATED", note,
+                {"purchase_order_rowid": line_id, "po_id": row["po_id"]}
+            )
         conn.execute("UPDATE pending_orders SET status='CLOSED', updated_at=? WHERE rowid=?", (now, line_id))
         record_po_event(conn, line_id, row["po_id"], "PO_LINE_CLOSED", note,
                         {"ordered_qty": row["ordered_qty"], "received_qty": row["received_qty"],
-                         "remaining_qty": int(row["ordered_qty"]) - int(row["received_qty"])})
+                         "remaining_qty": int(row["ordered_qty"]) - int(row["received_qty"]),
+                         "invalidated_pending_scans": len(linked_pending)})
         conn.commit()
     return jsonify({"status": "success", "message": "Purchase-order line closed."})
 
@@ -1348,6 +1370,31 @@ def close_purchase_order(line_id):
 @app.route("/purchase-orders/events", methods=["GET"])
 def purchase_order_events():
     return jsonify({"events": get_purchase_order_events(500)})
+
+
+@app.route("/purchase-orders/export.csv", methods=["GET"])
+def export_purchase_orders_csv():
+    orders = get_purchase_orders()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "PO_ID", "Supplier", "Supplier_Contact", "Supplier_Phone", "Supplier_Email",
+        "Item", "Expected_Batch", "Expected_MRP", "Ordered_Qty", "Received_Qty",
+        "Remaining_Qty", "Status", "Receiving_Mode", "Order_Date",
+        "Expected_Delivery", "Notes"
+    ])
+    for po in orders:
+        writer.writerow([
+            po["po_id"], po["supplier"], po["supplier_contact"], po["supplier_phone"],
+            po["supplier_email"], po["item_name"], po["expected_batch"], po["expected_mrp"],
+            po["ordered_qty"], po["received_qty"], po["remaining_qty"], po["line_status"],
+            po["receiving_mode"], po["order_date"], po["expected_delivery"], po["notes"]
+        ])
+    response = send_file(
+        io.BytesIO(output.getvalue().encode("utf-8-sig")),
+        as_attachment=True, download_name="aoi_purchase_orders.csv", mimetype="text/csv"
+    )
+    return response
 
 
 @app.route("/audit", methods=["GET"])
