@@ -1,5 +1,7 @@
 import os, re, io, csv, json, base64, sqlite3, subprocess, tempfile, urllib.request, threading
 from urllib.parse import urlparse
+import hmac
+from functools import wraps
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image, ImageOps, ImageStat, ImageDraw, ImageFilter
 from datetime import datetime
@@ -18,7 +20,28 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inventory_au
 # External sync is deliberately disabled until BOTH settings are supplied.
 SALES_SERVER_URL = os.environ.get("AOI_SALES_SYNC_URL", "").strip()
 SALES_SERVER_TOKEN = os.environ.get("AOI_SALES_SYNC_TOKEN", "").strip()
+AOI_AUTH_USERNAME = os.environ.get("AOI_AUTH_USERNAME", "").strip()
+AOI_AUTH_PASSWORD = os.environ.get("AOI_AUTH_PASSWORD", "")
+AUTH_ENABLED = bool(AOI_AUTH_USERNAME and AOI_AUTH_PASSWORD)
+if bool(AOI_AUTH_USERNAME) != bool(AOI_AUTH_PASSWORD):
+    raise RuntimeError("Set both AOI_AUTH_USERNAME and AOI_AUTH_PASSWORD, or leave both unset.")
 executor = ThreadPoolExecutor(max_workers=3)
+
+@app.before_request
+def require_operator_authentication():
+    if not AUTH_ENABLED:
+        return None
+    credentials = request.authorization
+    supplied_user = credentials.username if credentials else ""
+    supplied_password = credentials.password if credentials else ""
+    valid_user = hmac.compare_digest(supplied_user or "", AOI_AUTH_USERNAME)
+    valid_password = hmac.compare_digest(supplied_password or "", AOI_AUTH_PASSWORD)
+    if not (valid_user and valid_password):
+        response = jsonify({"error": "Operator authentication required."})
+        response.status_code = 401
+        response.headers["WWW-Authenticate"] = 'Basic realm="AOI Operator", charset="UTF-8"'
+        return response
+    return None
 
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
