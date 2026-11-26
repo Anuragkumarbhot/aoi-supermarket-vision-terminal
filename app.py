@@ -336,6 +336,10 @@ def review_scan(scan_id, decision, note=""):
         po_id_row = conn.execute(
             "SELECT po_id FROM pending_orders WHERE rowid=?", (po_rowid,)
         ).fetchone()
+        record_goods_receipt(
+            conn, po_rowid, po_id_row[0] if po_id_row else "", note.strip() or f"SCAN-{scan_id}",
+            1, scan["batch"], float(scan["mrp_num"]), "SCAN", note
+        )
         record_po_event(
             conn, po_rowid, po_id_row[0] if po_id_row else "",
             "SCAN_RECEIPT_APPROVED", note,
@@ -1131,6 +1135,7 @@ def _normalize_po_line(data):
         "item_name": _po_text(data, "item_name", True, 120),
         "expected_batch": _po_text(data, "expected_batch", True, 40),
         "expected_mrp": _po_amount(data.get("expected_mrp")),
+        "expected_unit_cost": _invoice_amount(data["expected_unit_cost"], "expected_unit_cost") if data.get("expected_unit_cost") not in (None, "") else None,
         "ordered_qty": _po_quantity(data.get("ordered_qty"), "ordered_qty"),
         "supplier_contact": _po_text(data, "supplier_contact", False, 100),
         "supplier_phone": _po_text(data, "supplier_phone", False, 30),
@@ -1161,12 +1166,12 @@ def _insert_po_line(conn, values):
     now = datetime.now().isoformat(timespec="seconds")
     cursor = conn.execute(
         """INSERT INTO pending_orders
-           (po_id, supplier, item_name, expected_batch, expected_mrp, ordered_qty, received_qty,
+           (po_id, supplier, item_name, expected_batch, expected_mrp, expected_unit_cost, ordered_qty, received_qty,
             supplier_contact, supplier_phone, supplier_email, order_date, expected_delivery,
             notes, status, receiving_mode, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 'OPEN', 'UNSET', ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 'OPEN', 'UNSET', ?, ?)""",
         (values["po_id"], values["supplier"], values["item_name"], values["expected_batch"],
-         values["expected_mrp"], values["ordered_qty"], values["supplier_contact"],
+         values["expected_mrp"], values["expected_unit_cost"], values["ordered_qty"], values["supplier_contact"],
          values["supplier_phone"], values["supplier_email"], values["order_date"],
          values["expected_delivery"], values["notes"], now, now)
     )
@@ -1377,7 +1382,7 @@ def update_purchase_order(line_id):
         "order_date": (10, False), "expected_delivery": (10, False),
         "notes": (500, False)
     }
-    allowed = set(allowed_text) | {"expected_mrp", "ordered_qty"}
+    allowed = set(allowed_text) | {"expected_mrp", "expected_unit_cost", "ordered_qty"}
     if set(data) - allowed:
         return jsonify({"error": "One or more fields are not editable."}), 400
     try:
@@ -1394,6 +1399,8 @@ def update_purchase_order(line_id):
                     updates[key] = _po_text({key: value}, key, required, maximum)
             elif key == "expected_mrp":
                 updates[key] = _po_amount(value)
+            elif key == "expected_unit_cost":
+                updates[key] = _invoice_amount(value, key) if value not in (None, "") else None
             elif key == "ordered_qty":
                 updates[key] = _po_quantity(value, key)
         with sqlite3.connect(DB_PATH) as conn:
@@ -1473,6 +1480,10 @@ def receive_purchase_order(line_id):
         conn.execute(
             "UPDATE pending_orders SET received_qty=?, status=?, receiving_mode='MANUAL', updated_at=? WHERE rowid=?",
             (new_received, new_status, now, line_id)
+        )
+        record_goods_receipt(
+            conn, line_id, row["po_id"], note, quantity,
+            row["expected_batch"], float(row["expected_mrp"]), "MANUAL", note
         )
         record_po_event(
             conn, line_id, row["po_id"], "PO_PARTIAL_RECEIPT" if new_status == "OPEN" else "PO_FULL_RECEIPT",
