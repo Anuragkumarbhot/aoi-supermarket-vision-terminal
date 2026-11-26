@@ -23,9 +23,11 @@ The browser UI also includes optional voice commands where the browser supports 
 |---|---|---|
 | `/` | GET | Dashboard, scan history, and pending purchase orders |
 | `/scan` | POST | Process a submitted image and return the scan result |
-| `/update` | POST | Edit supported scan fields |
-| `/delete` | POST | Delete one scan record |
-| `/clear` | POST | Clear scan history |
+| `/update` | POST | Correct OCR fields on unreviewed scans; revalidates MRP and PO matching |
+| `/review` | POST | Approve or reject a scan |
+| `/audit` | GET | Retrieve the latest append-only operator audit events |
+| `/delete` | POST | Delete one scan record while preserving its audit events |
+| `/clear` | POST | Clear scan history while recording deletion events |
 | `/export_pdf` | GET | Download a PDF audit report |
 | `/export_csv` | GET | Download scan records as CSV |
 
@@ -35,7 +37,11 @@ The browser UI also includes optional voice commands where the browser supports 
 - A scan with valid OCR fields and an exact batch/MRP purchase-order candidate can be approved by an operator from the dashboard.
 - Approval rechecks the linked purchase order and its remaining ordered quantity inside a database transaction, then adds one received unit and records the review timestamp and note.
 - OCR/PO exceptions can be rejected with an optional note. They cannot be approved until the scan has a valid PO match and valid required fields.
-- Existing SQLite databases receive additive review columns at startup; existing scan records are not automatically approved.
+- Operators can correct product, batch, manufacturing date, expiry date, and MRP on unreviewed scans. MRP corrections are parsed into the numeric field and the application rechecks date validity, image-quality flags, batch, MRP, and open PO quantity before making the scan eligible for review.
+- Approved and rejected scans are locked against field edits so receiving decisions cannot be silently altered after the fact.
+- Every scan capture, correction, approval, rejection, individual deletion, and shift reset writes an append-only event to `scan_review_events`. The dashboard shows the latest 100 events; `GET /audit` returns up to 500. Deleting a scan does not delete its audit events.
+- Audit event details include before/after values for corrections and PO linkage/received quantity increments for approvals. In unauthenticated local mode, the default operator label is `local-operator`; set `AOI_OPERATOR_NAME` to use a device/operator label. When Basic authentication is enabled, the configured username is recorded.
+- Existing SQLite databases receive additive review columns and the audit table at startup; existing scan records are not automatically approved.
 
 ## OCR validation and purchase-order reconciliation
 
@@ -81,7 +87,7 @@ The application creates `inventory_audit.db` beside `app.py`. Scan records and p
 - `v3_Neural_Audit_Report.pdf`
 - `v3_Neural_ERP.csv`
 
-The PDF is generated from the current scan history; the CSV includes timestamps, product, barcode, batch, manufacturing and expiry dates, MRP, action, and task status.
+The PDF is generated from the current scan history and safely treats missing OCR MRP as zero for aggregate totals. The CSV includes timestamps, product, barcode, batch, manufacturing and expiry dates, MRP, action, task status, review status, review timestamp, and review note. The operator event history is available separately through the dashboard and `/audit`.
 
 ## Important deployment and safety notes
 
