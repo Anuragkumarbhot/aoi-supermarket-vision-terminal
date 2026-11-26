@@ -53,8 +53,8 @@ The browser UI also includes optional voice commands where the browser supports 
 CSV import example:
 
 ```csv
-po_id,supplier,item_name,expected_batch,expected_mrp,ordered_qty,supplier_contact,supplier_phone,supplier_email,order_date,expected_delivery,notes
-PO-2026-901,North Distributor,Cereal 500g,NC-101,125.50,20,Ravi,9876543210,orders@example.com,2026-11-01,2026-11-05,Morning delivery
+po_id,supplier,item_name,expected_batch,expected_mrp,expected_unit_cost,ordered_qty,supplier_contact,supplier_phone,supplier_email,order_date,expected_delivery,notes
+PO-2026-901,North Distributor,Cereal 500g,NC-101,125.50,90.00,20,Ravi,9876543210,orders@example.com,2026-11-01,2026-11-05,Morning delivery
 ```
 
 ## Goods Received Notes (GRN) and supplier invoice reconciliation V1
