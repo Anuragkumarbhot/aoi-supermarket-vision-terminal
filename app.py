@@ -993,7 +993,7 @@ def _normalize_po_line(data):
         "expected_delivery": _po_date(data, "expected_delivery"),
         "notes": _po_text(data, "notes", False, 500),
     }
-    if values["supplier_email"] and not re.fullmatch(r"[^@\\s]+@[^@\\s]+\\.[^@\\s]+", values["supplier_email"]):
+    if values["supplier_email"] and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", values["supplier_email"]):
         raise ValueError("supplier_email must be a valid email address.")
     if values["order_date"] and values["expected_delivery"] and values["expected_delivery"] < values["order_date"]:
         raise ValueError("expected_delivery cannot be earlier than order_date.")
