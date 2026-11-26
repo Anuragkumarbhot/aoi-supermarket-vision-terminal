@@ -1468,7 +1468,7 @@ def update_purchase_order(line_id):
             if row is None:
                 return jsonify({"error": "Purchase-order line not found."}), 404
             before = {key: row[key] for key in updates}
-            identity_fields = {"po_id", "item_name", "expected_batch", "expected_mrp"}
+            identity_fields = {"po_id", "item_name", "expected_batch", "expected_mrp", "expected_unit_cost"}
             identity_changed = any(before.get(key) != value for key, value in updates.items() if key in identity_fields)
             linked_scans = conn.execute(
                 "SELECT COUNT(*) FROM scans WHERE matched_po_rowid=?", (line_id,)
@@ -1665,11 +1665,15 @@ def create_supplier_invoice():
         if not isinstance(lines, list) or not lines or len(lines) > 200:
             raise ValueError("lines must contain between 1 and 200 invoice lines.")
         normalized = []
+        seen_po_lines = set()
         calculated = 0.0
         for index, line in enumerate(lines, start=1):
             if not isinstance(line, dict):
                 raise ValueError(f"Invoice line {index} must be an object.")
             po_line_id = _po_quantity(line.get("po_line_id"), "po_line_id")
+            if po_line_id in seen_po_lines:
+                raise ValueError(f"Invoice line {index} repeats a purchase-order line.")
+            seen_po_lines.add(po_line_id)
             quantity = _po_quantity(line.get("quantity"), "quantity")
             unit_cost = _invoice_amount(line.get("unit_cost"), "unit_cost")
             line_total = round(quantity * unit_cost, 2)
