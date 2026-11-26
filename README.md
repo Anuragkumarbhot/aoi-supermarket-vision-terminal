@@ -39,7 +39,8 @@ The browser UI also includes optional voice commands where the browser supports 
 - OCR/PO exceptions can be rejected with an optional note. They cannot be approved until the scan has a valid PO match and valid required fields.
 - Operators can correct product, batch, manufacturing date, expiry date, and MRP on unreviewed scans. MRP corrections are parsed into the numeric field and the application rechecks date validity, image-quality flags, batch, MRP, and open PO quantity before making the scan eligible for review.
 - Approved and rejected scans are locked against field edits so receiving decisions cannot be silently altered after the fact. Expired inventory is excluded from approval even when OCR fields and the PO match.
-- Every scan capture, correction, approval, rejection, individual deletion, and shift reset writes an append-only event to `scan_review_events`. The dashboard shows the latest 100 events; `GET /audit` returns up to 500. Deleting a scan does not delete its audit events.
+- Every scan capture, correction, approval, rejection, individual deletion, and shift reset writes an append-only event to `scan_review_events`. Deletion and reset events retain a scan snapshot; deleting a scan does not delete its audit events.
+- Shift reset preserves the scan ID sequence so a later scan never reuses an ID already referenced by older audit events. The dashboard shows the latest 100 events; `GET /audit` returns up to 500.
 - Audit event details include before/after values for corrections and PO linkage/received quantity increments for approvals. In unauthenticated local mode, the default operator label is `local-operator`; set `AOI_OPERATOR_NAME` to use a device/operator label. When Basic authentication is enabled, the configured username is recorded.
 - Existing SQLite databases receive additive review columns and the audit table at startup; existing scan records are not automatically approved.
 
