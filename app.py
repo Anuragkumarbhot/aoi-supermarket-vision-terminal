@@ -194,10 +194,6 @@ def insert_scan(rec):
                     inventory_status = "MATCH CANDIDATE"
                     matched_po_rowid = available[0]
                     review_status = "PENDING"
-                    cur.execute(
-                        "UPDATE pending_orders SET receiving_mode='SCAN', updated_at=? WHERE rowid=? AND receiving_mode='UNSET'",
-                        (datetime.now().isoformat(timespec="seconds"), matched_po_rowid)
-                    )
                 elif not eligible:
                     inventory_status = "MANUAL RECEIVING MODE"
                 else:
@@ -263,10 +259,12 @@ def review_scan(scan_id, decision, note=""):
             return False, "No matching purchase order is linked to this scan."
         cur = conn.execute(
             """UPDATE pending_orders SET received_qty = received_qty + 1
+               SET received_qty = received_qty + 1, receiving_mode='SCAN', updated_at=?
                WHERE rowid = ? AND UPPER(TRIM(expected_batch)) = UPPER(TRIM(?))
                  AND expected_mrp IS NOT NULL AND ABS(expected_mrp - ?) < 0.005
-                 AND received_qty < ordered_qty AND status='OPEN' AND receiving_mode='SCAN'""",
-            (po_rowid, scan["batch"], scan["mrp_num"])
+                 AND received_qty < ordered_qty AND status='OPEN'
+                 AND receiving_mode IN ('UNSET', 'SCAN')""",
+            (datetime.now().isoformat(timespec="seconds"), po_rowid, scan["batch"], scan["mrp_num"])
         )
         if cur.rowcount != 1:
             return False, "Purchase order no longer matches or its ordered quantity is already reached."
@@ -1136,11 +1134,6 @@ def update():
                    ORDER BY rowid LIMIT 1""",
                 (fresh["batch"], fresh["mrp_num"])
             ).fetchone()
-            if candidate:
-                conn.execute(
-                    "UPDATE pending_orders SET receiving_mode='SCAN', updated_at=? WHERE rowid=? AND receiving_mode='UNSET'",
-                    (datetime.now().isoformat(timespec="seconds"), candidate["rowid"])
-                )
         new_review_status = "PENDING" if candidate else "NEEDS REVIEW"
         updated_action = "CORRECTED - READY FOR REVIEW" if candidate else (
             "EXPIRED - DO NOT RECEIVE" if expired else "REVIEW REQUIRED"
@@ -1308,6 +1301,12 @@ def receive_purchase_order(line_id):
             return jsonify({"error": "Only OPEN purchase-order lines can receive stock."}), 409
         if row["receiving_mode"] == "SCAN":
             return jsonify({"error": "This PO line is assigned to camera-scan receiving. Do not record the same delivery manually."}), 409
+        pending_scan_count = conn.execute(
+            "SELECT COUNT(*) FROM scans WHERE matched_po_rowid=? AND review_status='PENDING'",
+            (line_id,)
+        ).fetchone()[0]
+        if pending_scan_count:
+            return jsonify({"error": "This PO line has pending scan approvals. Review or reject them before switching to manual receiving."}), 409
         remaining = int(row["ordered_qty"]) - int(row["received_qty"])
         if quantity > remaining:
             return jsonify({"error": f"Quantity exceeds remaining ordered quantity ({remaining})."}), 400
