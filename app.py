@@ -750,8 +750,8 @@ def update():
 
     mrp_num = None
     if field == "mrp" and value:
-        normalized = re.sub(r"^(?:RS\\.?|₹)\\s*", "", value, flags=re.IGNORECASE).strip()
-        if not re.fullmatch(r"\\d+(?:\\.\\d{1,2})?", normalized):
+        normalized = re.sub(r"^(?:RS\.?|₹)\s*", "", value, flags=re.IGNORECASE).strip()
+        if not re.fullmatch(r"\d+(?:\.\d{1,2})?", normalized):
             return jsonify({"error": "MRP must be a positive amount, for example 100.00."}), 400
         mrp_num = float(normalized)
         if not (0 < mrp_num <= 1000000):
@@ -825,15 +825,30 @@ def review():
 
 @app.route("/delete", methods=["POST"])
 def delete():
-    data = request.get_json()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or isinstance(data.get("id"), bool) or not isinstance(data.get("id"), int):
+        return jsonify({"error": "A numeric scan id is required."}), 400
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM scans WHERE id = ?", (data['id'],))
+        scan = conn.execute("SELECT id, review_status FROM scans WHERE id=?", (data["id"],)).fetchone()
+        if scan is None:
+            return jsonify({"error": "Scan not found."}), 404
+        record_scan_event(
+            conn, data["id"], "SCAN_DELETED", "",
+            {"previous_review_status": scan[1]}
+        )
+        conn.execute("DELETE FROM scans WHERE id = ?", (data["id"],))
         conn.commit()
     return jsonify({"status": "success"})
 
 @app.route("/clear", methods=["POST"])
 def clear_db():
     with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT id, review_status FROM scans").fetchall()
+        for scan_id, review_status in rows:
+            record_scan_event(
+                conn, scan_id, "SCAN_DELETED_BY_RESET", "",
+                {"previous_review_status": review_status}
+            )
         conn.execute("DELETE FROM scans")
         conn.execute("DELETE FROM sqlite_sequence WHERE name='scans'")
         conn.commit()
@@ -847,7 +862,7 @@ def export_pdf():
     draw = ImageDraw.Draw(img)
     draw.rectangle([0, 0, W, 130], fill="#1E3A8A")
     draw.text((40, 35), "v3.0 NEURAL EDGE VISION AUDIT REPORT", fill="white", font_size=26)
-    total_val = sum(r["mrp_num"] for r in records)
+    total_val = sum(float(r["mrp_num"] or 0) for r in records)
     sub = f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  Total Units: {len(records)}  |  Total MRP Value: Rs. {total_val:.2f}"
     draw.text((40, 85), sub, fill="#93C5FD", font_size=18)
 
@@ -876,9 +891,9 @@ def export_csv():
     records = list(reversed(get_all_scans()))
     si = io.StringIO()
     cw = csv.writer(si)
-    cw.writerow(["ID", "Timestamp", "Product", "Barcode", "Batch", "MFR", "EXP", "MRP", "Action", "Neural_Task_Status"])
+    cw.writerow(["ID", "Timestamp", "Product", "Barcode", "Batch", "MFR", "EXP", "MRP", "Action", "Neural_Task_Status", "Review_Status", "Reviewed_At", "Review_Note"])
     for r in records:
-        cw.writerow([r["id"], r["time"], r["brand"], r["barcode"], r["batch"], r["mfr"], r["exp"], r["mrp_num"], r["action"], r["task_status"]])
+        cw.writerow([r["id"], r["time"], r["brand"], r["barcode"], r["batch"], r["mfr"], r["exp"], r["mrp_num"], r["action"], r["task_status"], r.get("review_status", ""), r.get("reviewed_at", ""), r.get("review_note", "")])
     output = io.BytesIO(si.getvalue().encode("utf-8"))
     return send_file(output, as_attachment=True, download_name="v3_Neural_ERP.csv", mimetype="text/csv")
 
