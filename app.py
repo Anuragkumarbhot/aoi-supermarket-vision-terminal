@@ -146,18 +146,24 @@ def review_scan(scan_id, decision, note=""):
         scan = conn.execute("SELECT * FROM scans WHERE id = ?", (scan_id,)).fetchone()
         if scan is None:
             return False, "Scan not found."
-        if scan["review_status"] != "PENDING":
-            return False, "This scan has already been reviewed or is not eligible for approval."
         if decision == "reject":
+            if scan["review_status"] not in {"PENDING", "NEEDS REVIEW"}:
+                return False, "This scan has already been reviewed."
             conn.execute(
-                "UPDATE scans SET review_status='REJECTED', reviewed_at=?, review_note=? WHERE id=? AND review_status='PENDING'",
+                "UPDATE scans SET review_status='REJECTED', reviewed_at=?, review_note=? WHERE id=? AND review_status IN ('PENDING', 'NEEDS REVIEW')",
                 (datetime.now().isoformat(timespec="seconds"), note.strip(), scan_id)
             )
             conn.commit()
             return True, "Scan rejected."
+        if scan["review_status"] != "PENDING":
+            return False, "This scan is not eligible for approval; resolve OCR and PO issues first."
+        if decision == "approve":
+            pass
         required = (scan["batch"], scan["mfr"], scan["exp"], scan["mrp_num"])
-        if not all(required) or not parse_label_date(scan["mfr"]) or not parse_label_date(scan["exp"]):
-            return False, "Required OCR fields are incomplete; edit and rescan before approval."
+        mfr_date = parse_label_date(scan["mfr"])
+        expiry_date = parse_label_date(scan["exp"])
+        if not all(required) or not mfr_date or not expiry_date or mfr_date >= expiry_date:
+            return False, "Required OCR dates or MRP are invalid; resolve the scan before approval."
         po_rowid = scan["matched_po_rowid"]
         if po_rowid is None:
             return False, "No matching purchase order is linked to this scan."
@@ -488,7 +494,7 @@ HTML_UI = """
           <td><span class="editable" onclick="editCell({{ s.id }}, 'exp', '{{ s.exp }}')">{{ s.exp }}</span></td>
           <td><span class="editable" onclick="editCell({{ s.id }}, 'mrp', '{{ s.mrp }}')">{{ s.mrp }}</span></td>
           <td style="font-size:9px; color:#38BDF8;">{{ s.task_status }}<br><b>{{ s.review_status }}</b>{% if s.review_note %}<br>{{ s.review_note }}{% endif %}</td>
-          <td>{% if s.review_status == 'PENDING' %}<button class="review-btn" onclick="reviewRow({{ s.id }}, 'approve')">Approve</button><button class="reject-btn" onclick="reviewRow({{ s.id }}, 'reject')">Reject</button>{% else %}{{ s.review_status or '—' }}{% endif %}</td>
+          <td>{% if s.review_status == 'PENDING' %}<button class="review-btn" onclick="reviewRow({{ s.id }}, 'approve')">Approve</button><button class="reject-btn" onclick="reviewRow({{ s.id }}, 'reject')">Reject</button>{% elif s.review_status == 'NEEDS REVIEW' %}<button class="reject-btn" onclick="reviewRow({{ s.id }}, 'reject')">Reject</button>{% else %}{{ s.review_status or '—' }}{% endif %}</td>
           <td><button class="del-btn" onclick="deleteRow({{ s.id }})">🗑️</button></td>
         </tr>
         {% endfor %}
