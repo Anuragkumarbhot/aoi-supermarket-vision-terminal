@@ -34,6 +34,7 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
             conn.execute("DELETE FROM scan_review_events")
             conn.execute("DELETE FROM purchase_order_events")
             conn.execute("DELETE FROM goods_receipts")
+            conn.execute("DELETE FROM inventory_movements")
             conn.execute("DELETE FROM supplier_invoice_lines")
             conn.execute("DELETE FROM supplier_invoice_events")
             conn.execute("DELETE FROM supplier_invoices")
@@ -59,6 +60,7 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
         self.assertIn("pending_orders", tables)
         self.assertIn("scan_review_events", tables)
         self.assertIn("goods_receipts", tables)
+        self.assertIn("inventory_movements", tables)
         self.assertIn("supplier_invoices", tables)
         self.assertIn("supplier_invoice_lines", tables)
         self.assertIn("supplier_invoice_events", tables)
@@ -824,6 +826,49 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
         reconcile = self.client.post(f"/supplier-invoices/{invoice.json['invoice_id']}/reconcile", json={})
         self.assertEqual(reconcile.status_code, 200)
         self.assertEqual(reconcile.json["reconciliation"]["status"], "MATCHED")
+
+
+    def test_grn_posts_inventory_and_sale_decrements_batch_balance_once(self):
+        created = self.client.post("/purchase-orders", json={
+            "po_id": "PO-STOCK-001", "supplier": "Stock Vendor",
+            "item_name": "Rice 1kg", "expected_batch": "RICE-A",
+            "expected_mrp": 80, "ordered_qty": 10,
+        })
+        self.assertEqual(created.status_code, 201)
+        line_id = created.json["line_id"]
+        receipt = self.client.post(f"/purchase-orders/{line_id}/receive", json={
+            "quantity": 6, "note": "DC-STOCK-001"
+        })
+        self.assertEqual(receipt.status_code, 200)
+        snapshot = self.client.get("/inventory").json
+        self.assertEqual(snapshot["total_units_on_hand"], 6)
+        self.assertEqual(snapshot["inventory"][0]["batch"], "RICE-A")
+        sale = self.client.post("/inventory/sales", json={
+            "item_name": "Rice 1kg", "batch": "RICE-A",
+            "quantity": 2, "source_ref": "POS-1001"
+        })
+        self.assertEqual(sale.status_code, 201)
+        self.assertEqual(sale.json["remaining_on_hand"], 4)
+        duplicate = self.client.post("/inventory/sales", json={
+            "item_name": "Rice 1kg", "batch": "RICE-A",
+            "quantity": 2, "source_ref": "POS-1001"
+        })
+        self.assertEqual(duplicate.status_code, 409)
+        oversell = self.client.post("/inventory/sales", json={
+            "item_name": "Rice 1kg", "batch": "RICE-A",
+            "quantity": 5, "source_ref": "POS-1002"
+        })
+        self.assertEqual(oversell.status_code, 409)
+        final = self.client.get("/inventory").json
+        self.assertEqual(final["total_units_on_hand"], 4)
+        self.assertEqual(final["lifetime_received_units"], 6)
+        self.assertEqual(final["lifetime_outflow_units"], 2)
+
+    def test_inventory_sale_rejects_invalid_payload(self):
+        response = self.client.post("/inventory/sales", json={
+            "item_name": "Soap", "batch": "S-1", "quantity": 1
+        })
+        self.assertEqual(response.status_code, 400)
 
     def test_oversized_request_is_rejected(self):
         aoi.app.config["MAX_CONTENT_LENGTH"] = 64
