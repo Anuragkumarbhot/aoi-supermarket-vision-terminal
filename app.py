@@ -1232,7 +1232,7 @@ def update_purchase_order(line_id):
         updates = {}
         for key, value in data.items():
             if key == "supplier_email" and value:
-                if not isinstance(value, str) or not re.fullmatch(r"[^@\\s]+@[^@\\s]+\\.[^@\\s]+", value.strip()):
+                if not isinstance(value, str) or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value.strip()):
                     raise ValueError("supplier_email must be a valid email address.")
             if key in allowed_text:
                 maximum, required = allowed_text[key]
