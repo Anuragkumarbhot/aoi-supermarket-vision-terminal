@@ -1765,7 +1765,7 @@ def review():
     decision = data.get("decision")
     note = data.get("note", "")
     ok, message = review_scan(data["id"], decision, note)
-    return (jsonify({"status": "success", "message": message}), 200) if ok else (jsonify({"error": message}), 409 if "already" in message or "quantity" in message or "no longer" in message else 400)
+    return (jsonify({"status": "success", "message": message}), 200) if ok else (jsonify({"error": message}), 409 if "already" in message or "not eligible" in message or "quantity" in message or "no longer" in message else 400)
 
 @app.route("/delete", methods=["POST"])
 def delete():
