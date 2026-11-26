@@ -29,6 +29,14 @@ The browser UI also includes optional voice commands where the browser supports 
 | `/export_pdf` | GET | Download a PDF audit report |
 | `/export_csv` | GET | Download scan records as CSV |
 
+## Operator review and receiving approval
+
+- Every scan is saved to the audit log and remains **PENDING** or **NEEDS REVIEW**; scanning alone never increments received stock.
+- A scan with valid OCR fields and an exact batch/MRP purchase-order candidate can be approved by an operator from the dashboard.
+- Approval rechecks the linked purchase order and its remaining ordered quantity inside a database transaction, then adds one received unit and records the review timestamp and note.
+- OCR/PO exceptions can be rejected with an optional note. They cannot be approved until the scan has a valid PO match and valid required fields.
+- Existing SQLite databases receive additive review columns at startup; existing scan records are not automatically approved.
+
 ## OCR validation and purchase-order reconciliation
 
 - OCR failures are recorded as blank fields; the application does not invent batch, manufacturing date, expiry date, or MRP values.
