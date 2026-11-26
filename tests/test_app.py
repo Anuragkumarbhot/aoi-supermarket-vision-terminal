@@ -33,6 +33,10 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
             conn.execute("DELETE FROM sqlite_sequence WHERE name='scans'")
             conn.execute("DELETE FROM scan_review_events")
             conn.execute("DELETE FROM purchase_order_events")
+            conn.execute("DELETE FROM goods_receipts")
+            conn.execute("DELETE FROM supplier_invoice_lines")
+            conn.execute("DELETE FROM supplier_invoice_events")
+            conn.execute("DELETE FROM supplier_invoices")
             conn.execute("DELETE FROM pending_orders WHERE po_id <> 'PO-2026-884'")
             conn.execute("UPDATE pending_orders SET received_qty = 12, status = 'OPEN', receiving_mode = 'UNSET'")
             conn.commit()
@@ -699,6 +703,98 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
         self.assertEqual(response.mimetype, "text/csv")
         self.assertIn(b"Supplier_Phone", response.data)
         self.assertIn(b"PO-EXPORT-001", response.data)
+
+    def test_manual_receipt_creates_grn_and_supplier_invoice_reconciles(self):
+        created = self.client.post("/purchase-orders", json={
+            "po_id": "PO-GRN-001", "supplier": "North Distributor",
+            "item_name": "Cereal", "expected_batch": "CR-101",
+            "expected_mrp": 125, "expected_unit_cost": 50,
+            "ordered_qty": 5,
+        })
+        self.assertEqual(created.status_code, 201)
+        line_id = created.json["line_id"]
+
+        receipt = self.client.post(f"/purchase-orders/{line_id}/receive", json={
+            "quantity": 5, "note": "DC-GRN-001"
+        })
+        self.assertEqual(receipt.status_code, 200)
+        grns = self.client.get("/goods-receipts").json["goods_receipts"]
+        self.assertEqual(len(grns), 1)
+        self.assertEqual(grns[0]["delivery_ref"], "DC-GRN-001")
+        self.assertEqual(grns[0]["quantity"], 5)
+        self.assertEqual(grns[0]["source"], "MANUAL")
+
+        invoice = self.client.post("/supplier-invoices", json={
+            "invoice_number": "INV-GRN-001", "supplier": "North Distributor",
+            "invoice_date": "2026-11-27", "delivery_ref": "DC-GRN-001",
+            "invoice_total": 250,
+            "lines": [{"po_line_id": line_id, "quantity": 5, "unit_cost": 50}],
+        })
+        self.assertEqual(invoice.status_code, 201)
+        self.assertEqual(invoice.json["reconciliation"]["status"], "MATCHED")
+        invoices = self.client.get("/supplier-invoices").json["supplier_invoices"]
+        self.assertEqual(invoices[0]["status"], "MATCHED")
+
+    def test_supplier_invoice_flags_quantity_supplier_and_unit_cost_discrepancies(self):
+        created = self.client.post("/purchase-orders", json={
+            "po_id": "PO-GRN-002", "supplier": "Correct Supplier",
+            "item_name": "Oil", "expected_batch": "OIL-2",
+            "expected_mrp": 150, "expected_unit_cost": 70,
+            "ordered_qty": 8,
+        })
+        line_id = created.json["line_id"]
+        self.client.post(f"/purchase-orders/{line_id}/receive", json={
+            "quantity": 8, "note": "DC-GRN-002"
+        })
+        invoice = self.client.post("/supplier-invoices", json={
+            "invoice_number": "INV-GRN-002", "supplier": "Wrong Supplier",
+            "invoice_date": "2026-11-27", "delivery_ref": "DC-GRN-002",
+            "invoice_total": 320,
+            "lines": [{"po_line_id": line_id, "quantity": 4, "unit_cost": 80}],
+        })
+        self.assertEqual(invoice.status_code, 201)
+        self.assertEqual(invoice.json["reconciliation"]["status"], "DISCREPANCY")
+        issues = invoice.json["reconciliation"]["discrepancies"][0]["issues"]
+        self.assertIn("SUPPLIER_MISMATCH", issues)
+        self.assertIn("QUANTITY_MISMATCH", issues)
+        self.assertIn("UNIT_COST_MISMATCH", issues)
+
+    def test_supplier_invoice_rejects_invalid_total_and_unknown_po(self):
+        payload = {
+            "invoice_number": "INV-BAD-001", "supplier": "Vendor",
+            "invoice_date": "2026-11-27", "delivery_ref": "DC-BAD-001",
+            "invoice_total": 101,
+            "lines": [{"po_line_id": 999999, "quantity": 1, "unit_cost": 100}],
+        }
+        mismatch = self.client.post("/supplier-invoices", json=payload)
+        self.assertEqual(mismatch.status_code, 400)
+        payload["invoice_total"] = 100
+        unknown_po = self.client.post("/supplier-invoices", json=payload)
+        self.assertEqual(unknown_po.status_code, 400)
+
+    def test_supplier_invoice_can_be_reconciled_again_after_grn_is_entered(self):
+        created = self.client.post("/purchase-orders", json={
+            "po_id": "PO-GRN-003", "supplier": "Vendor",
+            "item_name": "Tea", "expected_batch": "TEA-3",
+            "expected_mrp": 40, "expected_unit_cost": 25,
+            "ordered_qty": 3,
+        })
+        line_id = created.json["line_id"]
+        invoice = self.client.post("/supplier-invoices", json={
+            "invoice_number": "INV-GRN-003", "supplier": "Vendor",
+            "invoice_date": "2026-11-27", "delivery_ref": "DC-GRN-003",
+            "invoice_total": 75,
+            "lines": [{"po_line_id": line_id, "quantity": 3, "unit_cost": 25}],
+        })
+        self.assertEqual(invoice.status_code, 201)
+        self.assertEqual(invoice.json["reconciliation"]["status"], "DISCREPANCY")
+        receipt = self.client.post(f"/purchase-orders/{line_id}/receive", json={
+            "quantity": 3, "note": "DC-GRN-003"
+        })
+        self.assertEqual(receipt.status_code, 200)
+        reconcile = self.client.post(f"/supplier-invoices/{invoice.json['invoice_id']}/reconcile", json={})
+        self.assertEqual(reconcile.status_code, 200)
+        self.assertEqual(reconcile.json["reconciliation"]["status"], "MATCHED")
 
     def test_oversized_request_is_rejected(self):
         aoi.app.config["MAX_CONTENT_LENGTH"] = 64
