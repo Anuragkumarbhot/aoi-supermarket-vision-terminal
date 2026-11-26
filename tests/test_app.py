@@ -61,6 +61,7 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
         self.assertIn("goods_receipts", tables)
         self.assertIn("supplier_invoices", tables)
         self.assertIn("supplier_invoice_lines", tables)
+        self.assertIn("supplier_invoice_events", tables)
 
     def test_scan_rejects_non_json_payload(self):
         response = self.client.post("/scan", data="not-json", content_type="text/plain")
@@ -765,6 +766,27 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
         self.assertIn("SUPPLIER_MISMATCH", issues)
         self.assertIn("QUANTITY_MISMATCH", issues)
         self.assertIn("UNIT_COST_MISMATCH", issues)
+
+    def test_supplier_invoice_total_includes_tax_and_other_charges(self):
+        created = self.client.post("/purchase-orders", json={
+            "po_id": "PO-GRN-TAX", "supplier": "Tax Vendor",
+            "item_name": "Soap", "expected_batch": "SOAP-T",
+            "expected_mrp": 60, "expected_unit_cost": 30,
+            "ordered_qty": 2,
+        })
+        line_id = created.json["line_id"]
+        self.client.post(f"/purchase-orders/{line_id}/receive", json={
+            "quantity": 2, "note": "DC-TAX-1"
+        })
+        invoice = self.client.post("/supplier-invoices", json={
+            "invoice_number": "INV-TAX-001", "supplier": "Tax Vendor",
+            "invoice_date": "2026-11-27", "delivery_ref": "DC-TAX-1",
+            "invoice_total": 75, "tax_amount": 9, "other_charges": 6,
+            "lines": [{"po_line_id": line_id, "quantity": 2, "unit_cost": 30}],
+        })
+        self.assertEqual(invoice.status_code, 201)
+        self.assertEqual(invoice.json["reconciliation"]["status"], "MATCHED")
+        self.assertEqual(invoice.json["reconciliation"]["calculated_total"], 75)
 
     def test_supplier_invoice_rejects_invalid_total_and_unknown_po(self):
         payload = {
