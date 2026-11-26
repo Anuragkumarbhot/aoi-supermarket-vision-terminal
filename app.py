@@ -82,15 +82,46 @@ def init_db():
             conn.commit()
 
 def insert_scan(rec):
+    """Persist every scan, but reconcile stock only after strict PO validation."""
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
+        inventory_status = "REVIEW REQUIRED"
+        if rec.get("data_valid"):
+            matches = cur.execute(
+                """SELECT rowid, expected_mrp, ordered_qty, received_qty
+                   FROM pending_orders WHERE UPPER(TRIM(expected_batch)) = UPPER(TRIM(?))""",
+                (rec["batch"],)
+            ).fetchall()
+            if not matches:
+                inventory_status = "PO NOT MATCHED"
+            else:
+                exact = [row for row in matches
+                         if row[1] is not None and abs(float(row[1]) - float(rec["mrp_num"])) < 0.005]
+                if not exact:
+                    inventory_status = "MRP MISMATCH"
+                else:
+                    available = next((row for row in exact if row[3] < row[2]), None)
+                    if available:
+                        cur.execute(
+                            "UPDATE pending_orders SET received_qty = received_qty + 1 WHERE rowid = ? AND received_qty < ordered_qty",
+                            (available[0],)
+                        )
+                        inventory_status = "MATCHED"
+                    else:
+                        inventory_status = "ORDER QUANTITY REACHED"
+        rec["inventory_status"] = inventory_status
+        if inventory_status != "MATCHED":
+            rec["status_code"] = "FAIL" if not rec.get("data_valid") or inventory_status == "MRP MISMATCH" else "WARN"
+            rec["action"] = "REVIEW REQUIRED" if not rec.get("data_valid") else inventory_status + " - REVIEW"
+            rec["task_status"] += " | Inventory: " + inventory_status
+        else:
+            rec["task_status"] += " | Inventory: MATCHED"
         cur.execute("""
             INSERT INTO scans (time, brand, barcode, batch, mfr, exp, mrp, mrp_num, action, task_status)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (rec["time"], rec["brand"], rec["barcode"], rec["batch"], rec["mfr"], rec["exp"],
               rec["mrp"], rec["mrp_num"], rec["action"], rec["task_status"]))
         scan_id = cur.lastrowid
-        conn.execute("UPDATE pending_orders SET received_qty = received_qty + 1 WHERE expected_batch = ?", (rec["batch"],))
         conn.commit()
         return scan_id
 
@@ -190,6 +221,20 @@ def clean_ocr_digits(s):
     swap = {'O': '0', 'Q': '0', 'D': '0', 'I': '1', 'L': '1', '|': '1', 'S': '5', 'B': '8', 'Z': '2', 'g': '9', 'G': '6'}
     return "".join(swap.get(c, c) for c in s)
 
+def parse_label_date(value):
+    """Parse supported label dates and return the first day of their month."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip().replace(".", "/").replace("-", "/")
+    for fmt in ("%m/%Y", "%d/%m/%Y"):
+        try:
+            parsed = datetime.strptime(normalized, fmt)
+            return parsed.replace(day=1)
+        except ValueError:
+            continue
+    return None
+
+
 def multi_task_neural_pipeline(pil_img, active_product):
     # Step 1: Neural Bounding Box Stamp Localization
     localized_stamp = neural_detect_stamp_region(pil_img)
@@ -206,35 +251,62 @@ def multi_task_neural_pipeline(pil_img, active_product):
     text = raw_text.upper()
     batch_m = re.search(r'(?:B(?:ATCH|ATEH)?\.?\s*(?:NO|N0)?\.?)\s*[:\-]?\s*([A-Z0-9\-]{4,12})', text)
     if not batch_m: batch_m = re.search(r'\b([A-Z]{2}[\-\s]?\d{4,6})\b', text)
-    batch_code = batch_m.group(1).replace(" ", "-") if batch_m else "GL-26105"
+    batch_code = batch_m.group(1).replace(" ", "-") if batch_m else ""
 
     found_dates = re.findall(r'([0-9OQDILSBZGg]{2}[\/\.\-][0-9OQDILSBZGg]{4})', text)
-    cleaned_dates = [clean_ocr_digits(d) for d in found_dates]
-    mfr_str = cleaned_dates[0] if len(cleaned_dates) > 0 else "04/2026"
-    exp_str = cleaned_dates[1] if len(cleaned_dates) > 1 else "03/2028"
+    cleaned_dates = [clean_ocr_digits(d).replace(".", "/").replace("-", "/") for d in found_dates]
+    mfr_str = cleaned_dates[0] if len(cleaned_dates) > 0 else ""
+    exp_str = cleaned_dates[1] if len(cleaned_dates) > 1 else ""
 
-    price_m = re.search(r'(?:M\.?R\.?P\.?|RS\.?|₹)[\s\:\-\.]*(\d+(?:\.\d{2})?)', text)
-    if price_m: mrp_val = float(price_m.group(1))
+    price_m = re.search(r'(?:M\.?R\.?P\.?|RS\.?|₹)[\s\:\-\.]*([0-9]+(?:\.[0-9]{1,2})?)', text)
+    if price_m:
+        try:
+            mrp_val = float(price_m.group(1))
+        except ValueError:
+            mrp_val = None
     else:
         prices = re.findall(r'(?<!\d)\d{2,3}\.\d{2}(?!\d)', text)
-        mrp_val = float(prices[0]) if prices else 100.00
+        try:
+            mrp_val = float(prices[0]) if prices else None
+        except ValueError:
+            mrp_val = None
+
+    mfr_dt = parse_label_date(mfr_str)
+    exp_dt = parse_label_date(exp_str)
+    validation_issues = []
+    if not batch_code:
+        validation_issues.append("BATCH MISSING")
+    if not mfr_dt:
+        validation_issues.append("MFR DATE MISSING/INVALID")
+    if not exp_dt:
+        validation_issues.append("EXP DATE MISSING/INVALID")
+    if mfr_dt and exp_dt and mfr_dt >= exp_dt:
+        validation_issues.append("DATE ORDER INVALID")
+    if mrp_val is None or not (0 < mrp_val <= 1000000):
+        validation_issues.append("MRP MISSING/INVALID")
+    data_valid = not validation_issues
 
     now = datetime.now()
     action = "FRESH PASS"
     status_code = "PASS"
-    for fmt in ("%m/%Y", "%d/%m/%Y"):
-        try:
-            exp_dt = datetime.strptime(exp_str, fmt)
-            days_left = (exp_dt - now).days
-            if days_left <= 0: action, status_code = "EXPIRED - RETURN", "FAIL"
-            elif days_left <= 30: action, status_code = f"DISCOUNT ({days_left}d)", "WARN"
-            else: action, status_code = f"FRESH ({days_left}d)", "PASS"
-            break
-        except ValueError: pass
+    if data_valid:
+        # Treat an MM/YYYY expiry as valid through the end of that month.
+        if exp_dt.year < now.year or (exp_dt.year == now.year and exp_dt.month < now.month):
+            action, status_code = "EXPIRED - RETURN", "FAIL"
+        elif exp_dt.year == now.year and exp_dt.month == now.month:
+            action, status_code = "EXPIRY MONTH - REVIEW", "WARN"
+        else:
+            months_left = (exp_dt.year - now.year) * 12 + exp_dt.month - now.month
+            if months_left <= 1:
+                action, status_code = f"NEAR EXPIRY ({months_left}m)", "WARN"
+            else:
+                action, status_code = f"FRESH ({months_left}m)", "PASS"
+    else:
+        action, status_code = "REVIEW REQUIRED", "FAIL"
 
     if quality_res == "BLURRY":
         action += " | BLURRY"
-        status_code = "WARN"
+        status_code = "WARN" if data_valid else "FAIL"
 
     rec = {
         "time": now.strftime("%H:%M:%S"),
@@ -243,11 +315,13 @@ def multi_task_neural_pipeline(pil_img, active_product):
         "batch": batch_code,
         "mfr": mfr_str,
         "exp": exp_str,
-        "mrp": f"Rs.{mrp_val:.2f}",
+        "mrp": f"Rs.{mrp_val:.2f}" if mrp_val is not None else "",
         "mrp_num": mrp_val,
         "action": action,
         "status_code": status_code,
-        "task_status": f"Neural ROI | Bar: {barcode_res} | Qual: {quality_res}"
+        "data_valid": data_valid,
+        "task_status": f"Neural ROI | Bar: {barcode_res} | Qual: {quality_res}" +
+                       ((" | OCR: " + ", ".join(validation_issues)) if validation_issues else "")
     }
     rec["id"] = insert_scan(rec)
     sync_to_sales_server(rec)
