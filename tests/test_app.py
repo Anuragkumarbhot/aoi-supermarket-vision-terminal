@@ -32,7 +32,9 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
             conn.execute("DELETE FROM scans")
             conn.execute("DELETE FROM sqlite_sequence WHERE name='scans'")
             conn.execute("DELETE FROM scan_review_events")
-            conn.execute("UPDATE pending_orders SET received_qty = 12")
+            conn.execute("DELETE FROM purchase_order_events")
+            conn.execute("DELETE FROM pending_orders WHERE po_id <> 'PO-2026-884'")
+            conn.execute("UPDATE pending_orders SET received_qty = 12, status = 'OPEN'")
             conn.commit()
         self.client = aoi.app.test_client()
 
@@ -404,6 +406,172 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
         response = self.client.get("/export_pdf")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.mimetype, "application/pdf")
+
+    def test_purchase_order_create_and_list_with_supplier_details(self):
+        payload = {
+            "po_id": "PO-TEST-001", "supplier": "North Distributor",
+            "item_name": "Test Cereal", "expected_batch": "NC-001",
+            "expected_mrp": "125.50", "ordered_qty": "20",
+            "supplier_contact": "Ravi", "supplier_phone": "9876543210",
+            "supplier_email": "orders@example.test", "order_date": "2026-11-01",
+            "expected_delivery": "2026-11-05", "notes": "Morning delivery",
+        }
+        response = self.client.post("/purchase-orders", json=payload)
+        self.assertEqual(response.status_code, 201)
+        line_id = response.json["line_id"]
+        listing = self.client.get("/purchase-orders")
+        self.assertEqual(listing.status_code, 200)
+        line = next(x for x in listing.json["purchase_orders"] if x["line_id"] == line_id)
+        self.assertEqual(line["supplier_contact"], "Ravi")
+        self.assertEqual(line["remaining_qty"], 20)
+        self.assertEqual(line["line_status"], "OPEN")
+
+    def test_purchase_order_create_rejects_invalid_quantity_and_duplicate_line(self):
+        payload = {
+            "po_id": "PO-2026-884", "supplier": "Gericon Pharma India",
+            "item_name": "Cough Syrup DX", "expected_batch": "GL-26105",
+            "expected_mrp": 100, "ordered_qty": 10,
+        }
+        duplicate = self.client.post("/purchase-orders", json=payload)
+        self.assertEqual(duplicate.status_code, 400)
+        payload["po_id"] = "PO-TEST-BAD"
+        payload["item_name"] = "Test Item"
+        payload["expected_batch"] = "TB-001"
+        payload["ordered_qty"] = "2.5"
+        invalid = self.client.post("/purchase-orders", json=payload)
+        self.assertEqual(invalid.status_code, 400)
+
+    def test_purchase_order_csv_import_is_atomic(self):
+        csv_text = (
+            "po_id,supplier,item_name,expected_batch,expected_mrp,ordered_qty,supplier_phone,expected_delivery\n"
+            "PO-CSV-001,Vendor A,Item A,BATCH-A,45.00,10,9876500001,2026-12-01\n"
+            "PO-CSV-002,Vendor B,Item B,BATCH-B,55.00,12,9876500002,2026-12-03\n"
+        )
+        response = self.client.post("/purchase-orders/import", json={"csv_text": csv_text})
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json["imported"], 2)
+
+        duplicate_payload = {
+            "csv_text": (
+                "po_id,supplier,item_name,expected_batch,expected_mrp,ordered_qty\n"
+                "PO-CSV-003,Vendor C,Item C,BATCH-C,25,4\n"
+                "PO-CSV-003,Vendor C,Item C,BATCH-C,25,4\n"
+            )
+        }
+        failed = self.client.post("/purchase-orders/import", json=duplicate_payload)
+        self.assertEqual(failed.status_code, 400)
+        listing = self.client.get("/purchase-orders").json["purchase_orders"]
+        self.assertFalse(any(x["po_id"] == "PO-CSV-003" for x in listing))
+
+    def test_partial_receipt_updates_remaining_and_completes_line(self):
+        created = self.client.post("/purchase-orders", json={
+            "po_id": "PO-RECEIVE-001", "supplier": "Vendor",
+            "item_name": "Rice", "expected_batch": "RICE-1",
+            "expected_mrp": 80, "ordered_qty": 10,
+        })
+        line_id = created.json["line_id"]
+
+        first = self.client.post(f"/purchase-orders/{line_id}/receive", json={
+            "quantity": 4, "note": "Delivery challan DC-1"
+        })
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json["received_qty"], 4)
+        self.assertEqual(first.json["remaining_qty"], 6)
+
+        second = self.client.post(f"/purchase-orders/{line_id}/receive", json={
+            "quantity": 6, "note": "Balance delivery DC-2"
+        })
+        self.assertEqual(second.status_code, 200)
+        line = next(x for x in self.client.get("/purchase-orders").json["purchase_orders"]
+                    if x["line_id"] == line_id)
+        self.assertEqual(line["line_status"], "COMPLETE")
+        self.assertEqual(line["remaining_qty"], 0)
+        over = self.client.post(f"/purchase-orders/{line_id}/receive", json={
+            "quantity": 1, "note": "Extra unit"
+        })
+        self.assertEqual(over.status_code, 409)
+
+        events = self.client.get("/purchase-orders/events").json["events"]
+        self.assertIn("PO_PARTIAL_RECEIPT", [e["event_type"] for e in events])
+        self.assertIn("PO_FULL_RECEIPT", [e["event_type"] for e in events])
+
+    def test_partial_receipt_rejects_missing_note_and_over_receipt(self):
+        created = self.client.post("/purchase-orders", json={
+            "po_id": "PO-RECEIVE-002", "supplier": "Vendor",
+            "item_name": "Oil", "expected_batch": "OIL-1",
+            "expected_mrp": 150, "ordered_qty": 5,
+        })
+        line_id = created.json["line_id"]
+        missing_note = self.client.post(f"/purchase-orders/{line_id}/receive", json={
+            "quantity": 1, "note": ""
+        })
+        self.assertEqual(missing_note.status_code, 400)
+        over = self.client.post(f"/purchase-orders/{line_id}/receive", json={
+            "quantity": 6, "note": "Checked"
+        })
+        self.assertEqual(over.status_code, 400)
+
+    def test_purchase_order_edit_preserves_received_quantity_constraints(self):
+        created = self.client.post("/purchase-orders", json={
+            "po_id": "PO-EDIT-001", "supplier": "Vendor",
+            "item_name": "Flour", "expected_batch": "FLOUR-1",
+            "expected_mrp": 60, "ordered_qty": 10,
+        })
+        line_id = created.json["line_id"]
+        self.client.post(f"/purchase-orders/{line_id}/receive", json={
+            "quantity": 3, "note": "Partial counted delivery"
+        })
+        invalid = self.client.put(f"/purchase-orders/{line_id}", json={"ordered_qty": 2})
+        self.assertEqual(invalid.status_code, 400)
+        update = self.client.put(f"/purchase-orders/{line_id}", json={
+            "supplier": "Updated Vendor", "supplier_phone": "9999999999",
+            "expected_delivery": "2026-12-10", "ordered_qty": 12,
+        })
+        self.assertEqual(update.status_code, 200)
+        line = next(x for x in self.client.get("/purchase-orders").json["purchase_orders"]
+                    if x["line_id"] == line_id)
+        self.assertEqual(line["supplier"], "Updated Vendor")
+        self.assertEqual(line["received_qty"], 3)
+        self.assertEqual(line["remaining_qty"], 9)
+
+    def test_purchase_order_identity_fields_lock_after_scan_is_linked(self):
+        created = self.client.post("/purchase-orders", json={
+            "po_id": "PO-LOCK-001", "supplier": "Vendor",
+            "item_name": "Milk", "expected_batch": "MILK-26",
+            "expected_mrp": 50, "ordered_qty": 10,
+        })
+        line_id = created.json["line_id"]
+        record = {
+            "time": "12:20:00", "brand": "Milk", "barcode": "123",
+            "batch": "MILK-26", "mfr": "04/2026", "exp": "03/2028",
+            "mrp": "Rs.50.00", "mrp_num": 50.0, "action": "FRESH",
+            "status_code": "PASS", "task_status": "Neural ROI | Qual: PASS",
+            "data_valid": True,
+        }
+        scan_id = aoi.insert_scan(record)
+        self.assertIsNotNone(scan_id)
+        with sqlite3.connect(aoi.DB_PATH) as conn:
+            linked = conn.execute("SELECT matched_po_rowid FROM scans WHERE id=?", (scan_id,)).fetchone()[0]
+        self.assertEqual(linked, line_id)
+        locked = self.client.put(f"/purchase-orders/{line_id}", json={"expected_batch": "MILK-27"})
+        self.assertEqual(locked.status_code, 409)
+
+    def test_purchase_order_close_prevents_receiving(self):
+        created = self.client.post("/purchase-orders", json={
+            "po_id": "PO-CLOSE-001", "supplier": "Vendor",
+            "item_name": "Tea", "expected_batch": "TEA-1",
+            "expected_mrp": 30, "ordered_qty": 4,
+        })
+        line_id = created.json["line_id"]
+        closed = self.client.post(f"/purchase-orders/{line_id}/close", json={"note": "Supplier cancelled balance"})
+        self.assertEqual(closed.status_code, 200)
+        receive = self.client.post(f"/purchase-orders/{line_id}/receive", json={
+            "quantity": 1, "note": "Late delivery"
+        })
+        self.assertEqual(receive.status_code, 409)
+        line = next(x for x in self.client.get("/purchase-orders").json["purchase_orders"]
+                    if x["line_id"] == line_id)
+        self.assertEqual(line["line_status"], "CLOSED")
 
     def test_oversized_request_is_rejected(self):
         aoi.app.config["MAX_CONTENT_LENGTH"] = 64
