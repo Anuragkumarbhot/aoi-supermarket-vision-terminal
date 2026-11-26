@@ -72,6 +72,16 @@ def init_db():
                 received_qty INTEGER DEFAULT 0
             )
         """)
+        # Additive migration keeps existing local inventory databases usable.
+        scan_columns = {row[1] for row in conn.execute("PRAGMA table_info(scans)")}
+        for column, definition in (
+            ("review_status", "TEXT NOT NULL DEFAULT 'PENDING'"),
+            ("reviewed_at", "TEXT"),
+            ("review_note", "TEXT"),
+            ("matched_po_rowid", "INTEGER"),
+        ):
+            if column not in scan_columns:
+                conn.execute(f"ALTER TABLE scans ADD COLUMN {column} {definition}")
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM pending_orders")
         if cur.fetchone()[0] == 0:
@@ -82,48 +92,90 @@ def init_db():
             conn.commit()
 
 def insert_scan(rec):
-    """Persist every scan, but reconcile stock only after strict PO validation."""
+    """Save a scan for human review; never change received stock automatically."""
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         inventory_status = "REVIEW REQUIRED"
+        matched_po_rowid = None
+        review_status = "NEEDS REVIEW"
         if rec.get("data_valid"):
             matches = cur.execute(
                 """SELECT rowid, expected_mrp, ordered_qty, received_qty
                    FROM pending_orders WHERE UPPER(TRIM(expected_batch)) = UPPER(TRIM(?))""",
                 (rec["batch"],)
             ).fetchall()
+            exact = [row for row in matches
+                     if row[1] is not None and abs(float(row[1]) - float(rec["mrp_num"])) < 0.005]
             if not matches:
                 inventory_status = "PO NOT MATCHED"
+            elif not exact:
+                inventory_status = "MRP MISMATCH"
             else:
-                exact = [row for row in matches
-                         if row[1] is not None and abs(float(row[1]) - float(rec["mrp_num"])) < 0.005]
-                if not exact:
-                    inventory_status = "MRP MISMATCH"
+                available = next((row for row in exact if row[3] < row[2]), None)
+                if available:
+                    inventory_status = "MATCH CANDIDATE"
+                    matched_po_rowid = available[0]
+                    review_status = "PENDING"
                 else:
-                    available = next((row for row in exact if row[3] < row[2]), None)
-                    if available:
-                        cur.execute(
-                            "UPDATE pending_orders SET received_qty = received_qty + 1 WHERE rowid = ? AND received_qty < ordered_qty",
-                            (available[0],)
-                        )
-                        inventory_status = "MATCHED"
-                    else:
-                        inventory_status = "ORDER QUANTITY REACHED"
+                    inventory_status = "ORDER QUANTITY REACHED"
         rec["inventory_status"] = inventory_status
-        if inventory_status != "MATCHED":
+        if review_status != "PENDING":
             rec["status_code"] = "FAIL" if not rec.get("data_valid") or inventory_status == "MRP MISMATCH" else "WARN"
             rec["action"] = "REVIEW REQUIRED" if not rec.get("data_valid") else inventory_status + " - REVIEW"
-            rec["task_status"] += " | Inventory: " + inventory_status
-        else:
-            rec["task_status"] += " | Inventory: MATCHED"
+        rec["task_status"] += " | Inventory: " + inventory_status + " | Operator review: " + review_status
         cur.execute("""
-            INSERT INTO scans (time, brand, barcode, batch, mfr, exp, mrp, mrp_num, action, task_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO scans
+            (time, brand, barcode, batch, mfr, exp, mrp, mrp_num, action, task_status,
+             review_status, matched_po_rowid)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (rec["time"], rec["brand"], rec["barcode"], rec["batch"], rec["mfr"], rec["exp"],
-              rec["mrp"], rec["mrp_num"], rec["action"], rec["task_status"]))
+              rec["mrp"], rec["mrp_num"], rec["action"], rec["task_status"],
+              review_status, matched_po_rowid))
         scan_id = cur.lastrowid
         conn.commit()
         return scan_id
+
+def review_scan(scan_id, decision, note=""):
+    """Approve/reject a scan atomically; only approval changes PO received quantity."""
+    if decision not in {"approve", "reject"}:
+        return False, "Decision must be approve or reject."
+    if not isinstance(note, str) or len(note) > 500:
+        return False, "Review note must be text of at most 500 characters."
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        scan = conn.execute("SELECT * FROM scans WHERE id = ?", (scan_id,)).fetchone()
+        if scan is None:
+            return False, "Scan not found."
+        if scan["review_status"] != "PENDING":
+            return False, "This scan has already been reviewed or is not eligible for approval."
+        if decision == "reject":
+            conn.execute(
+                "UPDATE scans SET review_status='REJECTED', reviewed_at=?, review_note=? WHERE id=? AND review_status='PENDING'",
+                (datetime.now().isoformat(timespec="seconds"), note.strip(), scan_id)
+            )
+            conn.commit()
+            return True, "Scan rejected."
+        required = (scan["batch"], scan["mfr"], scan["exp"], scan["mrp_num"])
+        if not all(required) or not parse_label_date(scan["mfr"]) or not parse_label_date(scan["exp"]):
+            return False, "Required OCR fields are incomplete; edit and rescan before approval."
+        po_rowid = scan["matched_po_rowid"]
+        if po_rowid is None:
+            return False, "No matching purchase order is linked to this scan."
+        cur = conn.execute(
+            """UPDATE pending_orders SET received_qty = received_qty + 1
+               WHERE rowid = ? AND UPPER(TRIM(expected_batch)) = UPPER(TRIM(?))
+                 AND expected_mrp IS NOT NULL AND ABS(expected_mrp - ?) < 0.005
+                 AND received_qty < ordered_qty""",
+            (po_rowid, scan["batch"], scan["mrp_num"])
+        )
+        if cur.rowcount != 1:
+            return False, "Purchase order no longer matches or its ordered quantity is already reached."
+        conn.execute(
+            "UPDATE scans SET review_status='APPROVED', reviewed_at=?, review_note=? WHERE id=? AND review_status='PENDING'",
+            (datetime.now().isoformat(timespec="seconds"), note.strip(), scan_id)
+        )
+        conn.commit()
+        return True, "Scan approved and one unit received.";
 
 def get_all_scans():
     with sqlite3.connect(DB_PATH) as conn:
@@ -374,6 +426,8 @@ HTML_UI = """
   td { padding: 5px 3px; border-bottom: 1px solid var(--border); }
   .editable { background: rgba(56, 189, 248, 0.15); color: #38BDF8; padding: 2px 4px; border-radius: 3px; cursor: pointer; }
   .del-btn { background: transparent; color: #EF4444; border: none; font-size: 12px; cursor: pointer; }
+  .review-btn { background: #047857; color: white; padding: 5px 7px; margin: 2px; }
+  .reject-btn { background: #991B1B; color: white; padding: 5px 7px; margin: 2px; }
 </style>
 </head>
 <body>
@@ -424,7 +478,7 @@ HTML_UI = """
   <div class="table-wrap">
     <div style="background:#090D16; padding:5px; font-size:10px; font-weight:bold; color:#34D399; border-bottom:1px solid var(--border);">📝 Neural Inward Scans Log</div>
     <table id="logTable">
-      <thead><tr><th>#</th><th>Product</th><th>Batch</th><th>EXP</th><th>MRP</th><th>Neural Pipeline Status</th><th>Del</th></tr></thead>
+      <thead><tr><th>#</th><th>Product</th><th>Batch</th><th>EXP</th><th>MRP</th><th>Pipeline / Review</th><th>Review</th><th>Del</th></tr></thead>
       <tbody>
         {% for s in scans %}
         <tr id="row-{{ s.id }}">
@@ -433,7 +487,8 @@ HTML_UI = """
           <td><span class="editable" onclick="editCell({{ s.id }}, 'batch', '{{ s.batch }}')">{{ s.batch }}</span></td>
           <td><span class="editable" onclick="editCell({{ s.id }}, 'exp', '{{ s.exp }}')">{{ s.exp }}</span></td>
           <td><span class="editable" onclick="editCell({{ s.id }}, 'mrp', '{{ s.mrp }}')">{{ s.mrp }}</span></td>
-          <td style="font-size:9px; color:#38BDF8;">{{ s.task_status }}</td>
+          <td style="font-size:9px; color:#38BDF8;">{{ s.task_status }}<br><b>{{ s.review_status }}</b>{% if s.review_note %}<br>{{ s.review_note }}{% endif %}</td>
+          <td>{% if s.review_status == 'PENDING' %}<button class="review-btn" onclick="reviewRow({{ s.id }}, 'approve')">Approve</button><button class="reject-btn" onclick="reviewRow({{ s.id }}, 'reject')">Reject</button>{% else %}{{ s.review_status or '—' }}{% endif %}</td>
           <td><button class="del-btn" onclick="deleteRow({{ s.id }})">🗑️</button></td>
         </tr>
         {% endfor %}
@@ -539,6 +594,14 @@ function editCell(id, field, currentVal) {
   .then(() => window.location.reload());
 }
 
+function reviewRow(id, decision) {
+  const note = prompt("Optional review note:", "") || "";
+  if (!confirm((decision === "approve" ? "Approve this scan and add one received unit to the linked PO?" : "Reject this scan?"))) return;
+  fetch('/review', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: id, decision: decision, note: note }) })
+  .then(async r => { const d = await r.json(); if (!r.ok) throw new Error(d.error || "Review failed"); alert(d.message); window.location.reload(); })
+  .catch(e => alert(e.message));
+}
+
 function deleteRow(id) {
   if (!confirm("Delete scan #" + id + "?")) return;
   fetch('/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: id }) })
@@ -596,6 +659,16 @@ def update():
             conn.execute(f"UPDATE scans SET {data['field']} = ? WHERE id = ?", (data["value"], data["id"]))
             conn.commit()
     return jsonify({"status": "success"})
+
+@app.route("/review", methods=["POST"])
+def review():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("id"), int):
+        return jsonify({"error": "A numeric scan id is required."}), 400
+    decision = data.get("decision")
+    note = data.get("note", "")
+    ok, message = review_scan(data["id"], decision, note)
+    return (jsonify({"status": "success", "message": message}), 200) if ok else (jsonify({"error": message}), 409 if "already" in message or "quantity" in message or "no longer" in message else 400)
 
 @app.route("/delete", methods=["POST"])
 def delete():
