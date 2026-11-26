@@ -848,12 +848,14 @@ def delete():
     if not isinstance(data, dict) or isinstance(data.get("id"), bool) or not isinstance(data.get("id"), int):
         return jsonify({"error": "A numeric scan id is required."}), 400
     with sqlite3.connect(DB_PATH) as conn:
-        scan = conn.execute("SELECT id, review_status FROM scans WHERE id=?", (data["id"],)).fetchone()
+        conn.row_factory = sqlite3.Row
+        scan = conn.execute("SELECT * FROM scans WHERE id=?", (data["id"],)).fetchone()
         if scan is None:
             return jsonify({"error": "Scan not found."}), 404
+        snapshot_fields = ("time", "brand", "barcode", "batch", "mfr", "exp", "mrp", "mrp_num", "action", "task_status", "review_status", "reviewed_at", "review_note")
         record_scan_event(
             conn, data["id"], "SCAN_DELETED", "",
-            {"previous_review_status": scan[1]}
+            {"scan_snapshot": {key: scan[key] for key in snapshot_fields}}
         )
         conn.execute("DELETE FROM scans WHERE id = ?", (data["id"],))
         conn.commit()
@@ -862,14 +864,16 @@ def delete():
 @app.route("/clear", methods=["POST"])
 def clear_db():
     with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute("SELECT id, review_status FROM scans").fetchall()
-        for scan_id, review_status in rows:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM scans").fetchall()
+        snapshot_fields = ("time", "brand", "barcode", "batch", "mfr", "exp", "mrp", "mrp_num", "action", "task_status", "review_status", "reviewed_at", "review_note")
+        for scan in rows:
             record_scan_event(
-                conn, scan_id, "SCAN_DELETED_BY_RESET", "",
-                {"previous_review_status": review_status}
+                conn, scan["id"], "SCAN_DELETED_BY_RESET", "",
+                {"scan_snapshot": {key: scan[key] for key in snapshot_fields}}
             )
         conn.execute("DELETE FROM scans")
-        conn.execute("DELETE FROM sqlite_sequence WHERE name='scans'")
+        # Keep sqlite_sequence intact: audit event scan IDs must never be reused.
         conn.commit()
     return jsonify({"status": "cleared"})
 
