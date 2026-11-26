@@ -186,6 +186,22 @@ def init_db():
                 details_json TEXT NOT NULL DEFAULT '{}'
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS inventory_movements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_name TEXT NOT NULL,
+                batch TEXT NOT NULL DEFAULT '',
+                movement_type TEXT NOT NULL CHECK(movement_type IN ('RECEIPT','SALE','ADJUSTMENT')),
+                quantity INTEGER NOT NULL CHECK(quantity > 0),
+                quantity_delta INTEGER NOT NULL,
+                source_ref TEXT NOT NULL UNIQUE,
+                source_type TEXT NOT NULL,
+                movement_at TEXT NOT NULL,
+                operator TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_inventory_movements_item_batch ON inventory_movements(item_name, batch)")
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM pending_orders")
         if cur.fetchone()[0] == 0:
@@ -1036,15 +1052,28 @@ def get_purchase_order_events(limit=100):
 
 
 def record_goods_receipt(conn, po_rowid, po_id, delivery_ref, quantity, actual_batch, actual_mrp, source, note=""):
-    conn.execute(
+    received_at = datetime.now().isoformat(timespec="seconds")
+    cur = conn.execute(
         """INSERT INTO goods_receipts
            (po_rowid, po_id, delivery_ref, quantity, actual_batch, actual_mrp,
             source, received_at, operator, note)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (po_rowid, str(po_id), delivery_ref.strip(), int(quantity), str(actual_batch or ""),
-         actual_mrp, source, datetime.now().isoformat(timespec="seconds"),
-         current_operator(), note.strip() if isinstance(note, str) else "")
+         actual_mrp, source, received_at, current_operator(),
+         note.strip() if isinstance(note, str) else "")
     )
+    grn_id = cur.lastrowid
+    po_item = conn.execute("SELECT item_name FROM pending_orders WHERE rowid=?", (po_rowid,)).fetchone()
+    if po_item:
+        conn.execute(
+            """INSERT INTO inventory_movements
+               (item_name, batch, movement_type, quantity, quantity_delta, source_ref,
+                source_type, movement_at, operator, note)
+               VALUES (?, ?, 'RECEIPT', ?, ?, ?, 'GRN', ?, ?, ?)""",
+            (po_item[0], str(actual_batch or ""), int(quantity), int(quantity),
+             f"GRN-{grn_id}", received_at, current_operator(),
+             note.strip() if isinstance(note, str) else "")
+        )
 
 
 def get_supplier_invoices(limit=100):
@@ -1644,6 +1673,68 @@ def export_purchase_orders_csv():
 @app.route("/goods-receipts", methods=["GET"])
 def goods_receipts():
     return jsonify({"goods_receipts": get_goods_receipts(500)})
+
+@app.route("/inventory", methods=["GET"])
+def inventory_snapshot():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT item_name, batch, SUM(quantity_delta) AS on_hand,
+                      SUM(CASE WHEN movement_type='RECEIPT' THEN quantity ELSE 0 END) AS received_total,
+                      SUM(CASE WHEN movement_type='SALE' THEN quantity ELSE 0 END) AS sold_total,
+                      MAX(movement_at) AS last_movement
+               FROM inventory_movements
+               GROUP BY item_name, batch
+               HAVING SUM(quantity_delta) != 0
+               ORDER BY item_name COLLATE NOCASE, batch"""
+        ).fetchall()
+        totals = conn.execute(
+            """SELECT COALESCE(SUM(CASE WHEN quantity_delta > 0 THEN quantity_delta ELSE 0 END),0),
+                      COALESCE(SUM(CASE WHEN quantity_delta < 0 THEN -quantity_delta ELSE 0 END),0)
+               FROM inventory_movements"""
+        ).fetchone()
+    return jsonify({"inventory": [dict(row) for row in rows],
+                    "total_units_on_hand": sum(int(row["on_hand"]) for row in rows),
+                    "lifetime_received_units": int(totals[0]),
+                    "lifetime_outflow_units": int(totals[1])})
+
+
+@app.route("/inventory/sales", methods=["POST"])
+def record_inventory_sale():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "A JSON object is required."}), 400
+    try:
+        item_name = _po_text(data, "item_name", True, 160)
+        batch = _po_text(data, "batch", True, 100)
+        quantity = _po_quantity(data.get("quantity"), "quantity")
+        source_ref = _po_text(data, "source_ref", True, 120)
+        note = _po_text(data, "note", False, 500)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        balance = conn.execute(
+            "SELECT COALESCE(SUM(quantity_delta),0) FROM inventory_movements WHERE item_name=? AND batch=?",
+            (item_name, batch)
+        ).fetchone()[0]
+        if quantity > int(balance):
+            return jsonify({"error": f"Insufficient on-hand stock for batch (available: {int(balance)})."}), 409
+        try:
+            conn.execute(
+                """INSERT INTO inventory_movements
+                   (item_name, batch, movement_type, quantity, quantity_delta, source_ref,
+                    source_type, movement_at, operator, note)
+                   VALUES (?, ?, 'SALE', ?, ?, ?, 'MANUAL_SALE', ?, ?, ?)""",
+                (item_name, batch, quantity, -quantity, "SALE-" + source_ref,
+                 datetime.now().isoformat(timespec="seconds"), current_operator(), note)
+            )
+        except sqlite3.IntegrityError:
+            return jsonify({"error": "This sale source_ref has already been recorded."}), 409
+        conn.commit()
+        remaining = int(balance) - quantity
+    return jsonify({"status": "success", "remaining_on_hand": remaining,
+                    "message": f"Recorded {quantity} sold unit(s)."}), 201
 
 
 @app.route("/supplier-invoices", methods=["GET"])
