@@ -186,6 +186,19 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(aoi.get_pending_orders()[0]["received_qty"], before)
 
+    def test_flagged_scan_can_be_rejected_but_not_approved(self):
+        record = {
+            "time": "12:04:00", "brand": "Test", "barcode": "123",
+            "batch": "", "mfr": "", "exp": "", "mrp": "", "mrp_num": None,
+            "action": "REVIEW REQUIRED", "status_code": "FAIL",
+            "task_status": "TEST", "data_valid": False,
+        }
+        scan_id = aoi.insert_scan(record)
+        ok, message = aoi.review_scan(scan_id, "approve")
+        self.assertFalse(ok)
+        ok, message = aoi.review_scan(scan_id, "reject", "Unreadable label")
+        self.assertTrue(ok, message)
+
     def test_review_endpoint_validates_and_approves(self):
         record = {
             "time": "12:03:00", "brand": "Test", "barcode": "123",
