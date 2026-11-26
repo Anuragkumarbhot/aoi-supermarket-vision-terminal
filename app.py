@@ -258,7 +258,7 @@ def review_scan(scan_id, decision, note=""):
         if po_rowid is None:
             return False, "No matching purchase order is linked to this scan."
         cur = conn.execute(
-            """UPDATE pending_orders SET received_qty = received_qty + 1
+            """UPDATE pending_orders
                SET received_qty = received_qty + 1, receiving_mode='SCAN', updated_at=?
                WHERE rowid = ? AND UPPER(TRIM(expected_batch)) = UPPER(TRIM(?))
                  AND expected_mrp IS NOT NULL AND ABS(expected_mrp - ?) < 0.005
