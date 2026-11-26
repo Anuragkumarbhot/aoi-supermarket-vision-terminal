@@ -337,7 +337,7 @@ def review_scan(scan_id, decision, note=""):
             "SELECT po_id FROM pending_orders WHERE rowid=?", (po_rowid,)
         ).fetchone()
         record_goods_receipt(
-            conn, po_rowid, po_id_row[0] if po_id_row else "", note.strip() or f"SCAN-{scan_id}",
+            conn, po_rowid, po_id_row[0] if po_id_row else "", f"SCAN-{scan_id}",
             1, scan["batch"], float(scan["mrp_num"]), "SCAN", note
         )
         record_po_event(
@@ -661,7 +661,7 @@ HTML_UI = """
       <button class="review-btn" type="submit">＋ Create PO line</button>
     </form>
     <div style="margin-top:10px;">
-      <textarea id="poCsvText" rows="3" style="width:100%;box-sizing:border-box;background:#0B1220;color:#E2E8F0;border:1px solid var(--border);border-radius:6px;padding:7px;font-size:11px;" placeholder="CSV import headers: po_id,supplier,item_name,expected_batch,expected_mrp,ordered_qty,supplier_contact,supplier_phone,supplier_email,order_date,expected_delivery,notes"></textarea>
+      <textarea id="poCsvText" rows="3" style="width:100%;box-sizing:border-box;background:#0B1220;color:#E2E8F0;border:1px solid var(--border);border-radius:6px;padding:7px;font-size:11px;" placeholder="CSV import headers: po_id,supplier,item_name,expected_batch,expected_mrp,expected_unit_cost,ordered_qty,supplier_contact,supplier_phone,supplier_email,order_date,expected_delivery,notes"></textarea>
       <button class="po-button" onclick="importPurchaseOrders()">Import CSV</button>
     </div>
   </div>
@@ -1605,7 +1605,7 @@ def export_purchase_orders_csv():
     writer = csv.writer(output)
     writer.writerow([
         "PO_ID", "Supplier", "Supplier_Contact", "Supplier_Phone", "Supplier_Email",
-        "Item", "Expected_Batch", "Expected_MRP", "Ordered_Qty", "Received_Qty",
+        "Item", "Expected_Batch", "Expected_MRP", "Expected_Unit_Cost", "Ordered_Qty", "Received_Qty",
         "Remaining_Qty", "Status", "Receiving_Mode", "Order_Date",
         "Expected_Delivery", "Notes"
     ])
@@ -1613,7 +1613,7 @@ def export_purchase_orders_csv():
         writer.writerow([
             po["po_id"], po["supplier"], po["supplier_contact"], po["supplier_phone"],
             po["supplier_email"], po["item_name"], po["expected_batch"], po["expected_mrp"],
-            po["ordered_qty"], po["received_qty"], po["remaining_qty"], po["line_status"],
+            po["expected_unit_cost"], po["ordered_qty"], po["received_qty"], po["remaining_qty"], po["line_status"],
             po["receiving_mode"], po["order_date"], po["expected_delivery"], po["notes"]
         ])
     response = send_file(
