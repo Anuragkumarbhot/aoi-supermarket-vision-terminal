@@ -119,6 +119,61 @@ class AOISecurityAndFunctionalTests(unittest.TestCase):
             count = conn.execute("SELECT COUNT(*) FROM scans").fetchone()[0]
         self.assertEqual(count, 1)
 
+    def test_missing_ocr_fields_are_not_filled_with_demo_defaults(self):
+        from unittest.mock import patch
+        from PIL import Image
+
+        with patch.object(aoi, "neural_detect_stamp_region", side_effect=lambda image: image), \
+             patch.object(aoi, "task_decode_barcode", return_value="NONE"), \
+             patch.object(aoi, "task_run_neural_ocr", return_value=""), \
+             patch.object(aoi, "task_inspect_quality", return_value="PASS"):
+            record = aoi.multi_task_neural_pipeline(Image.new("RGB", (80, 80)), "Test")
+
+        self.assertEqual(record["batch"], "")
+        self.assertEqual(record["mfr"], "")
+        self.assertEqual(record["exp"], "")
+        self.assertIsNone(record["mrp_num"])
+        self.assertEqual(record["status_code"], "FAIL")
+        self.assertEqual(record["action"], "REVIEW REQUIRED")
+        self.assertEqual(record["inventory_status"], "REVIEW REQUIRED")
+
+    def test_only_exact_batch_and_mrp_match_increments_received_quantity(self):
+        before = aoi.get_pending_orders()[0]["received_qty"]
+        record = {
+            "time": "12:00:00", "brand": "Test", "barcode": "123",
+            "batch": "GL-26105", "mfr": "04/2026", "exp": "03/2028",
+            "mrp": "Rs.100.00", "mrp_num": 100.0, "action": "FRESH",
+            "status_code": "PASS", "task_status": "TEST", "data_valid": True,
+        }
+        aoi.insert_scan(record)
+        after_match = aoi.get_pending_orders()[0]["received_qty"]
+        self.assertEqual(after_match, before + 1)
+        self.assertEqual(record["inventory_status"], "MATCHED")
+
+        mismatch = dict(record, mrp_num=125.0, mrp="Rs.125.00", time="12:01:00")
+        aoi.insert_scan(mismatch)
+        after_mismatch = aoi.get_pending_orders()[0]["received_qty"]
+        self.assertEqual(after_mismatch, after_match)
+        self.assertEqual(mismatch["inventory_status"], "MRP MISMATCH")
+
+    def test_invalid_or_unverified_scan_never_increments_purchase_order(self):
+        before = aoi.get_pending_orders()[0]["received_qty"]
+        record = {
+            "time": "12:02:00", "brand": "Test", "barcode": "123",
+            "batch": "GL-26105", "mfr": "", "exp": "", "mrp": "",
+            "mrp_num": None, "action": "REVIEW REQUIRED", "status_code": "FAIL",
+            "task_status": "TEST", "data_valid": False,
+        }
+        aoi.insert_scan(record)
+        self.assertEqual(aoi.get_pending_orders()[0]["received_qty"], before)
+        self.assertEqual(record["inventory_status"], "REVIEW REQUIRED")
+
+    def test_label_date_parser_rejects_invalid_dates(self):
+        self.assertIsNotNone(aoi.parse_label_date("04/2026"))
+        self.assertIsNotNone(aoi.parse_label_date("15/04/2026"))
+        self.assertIsNone(aoi.parse_label_date("19/2026"))
+        self.assertIsNone(aoi.parse_label_date(""))
+
     def test_oversized_request_is_rejected(self):
         aoi.app.config["MAX_CONTENT_LENGTH"] = 64
         response = self.client.post(
