@@ -29,6 +29,14 @@ The browser UI also includes optional voice commands where the browser supports 
 | `/export_pdf` | GET | Download a PDF audit report |
 | `/export_csv` | GET | Download scan records as CSV |
 
+## OCR validation and purchase-order reconciliation
+
+- OCR failures are recorded as blank fields; the application does not invent batch, manufacturing date, expiry date, or MRP values.
+- A scan is marked **REVIEW REQUIRED** when a required field is missing or invalid, the manufacturing date is not earlier than expiry, the MRP is outside the accepted positive range, or image quality is not PASS.
+- A scan increments a pending purchase order only when its extracted batch matches the expected batch, its MRP matches the expected MRP (within 0.005), and the order has not reached its ordered quantity.
+- Batch matches with a different MRP are flagged **MRP MISMATCH**. Other scans remain in the audit log but do not change received quantities.
+- These checks are conservative safeguards, not proof that OCR is accurate. Operators must verify label fields and physical quantities before accepting stock.
+
 ## Technology
 
 - Python
