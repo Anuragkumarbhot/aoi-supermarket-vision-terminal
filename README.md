@@ -172,3 +172,27 @@ See [PROJECT_SPECIFICATION.md](PROJECT_SPECIFICATION.md) for the system specific
 ---
 
 Built by [Anuragkumarbhot](https://github.com/Anuragkumarbhot).
+
+ 
+## Inventory movement ledger V1
+
+- Manual PO receipts and approved scan receipts post a stock-in movement automatically in the same SQLite transaction as the GRN. The movement uses the generated GRN ID as a unique source reference, preventing a duplicate receipt movement.
+- `GET /inventory` returns on-hand quantities grouped by product and batch, lifetime received units, and lifetime outflow units. The ledger is append-only; current balances are calculated from movement deltas rather than treating PO ordered/received quantities as on-hand stock.
+- `POST /inventory/sales` records an explicit batch-specific sale. Required fields: `item_name`, `batch`, positive integer `quantity`, and unique `source_ref` (the POS transaction/reference). The API rejects duplicate source references and sales exceeding available batch stock.
+- Sales are not inferred from camera scans or supplier invoices. Connect a trusted POS integration or submit verified sale events to this endpoint before using the ledger as live stock.
+ 
+### Inventory API examples
+
+```http
+GET /inventory
+```
+
+```json
+{
+  "item_name": "Rice 1kg",
+  "batch": "RICE-A",
+  "quantity": 2,
+  "source_ref": "POS-1001",
+  "note": "POS counter sale"
+}
+```
